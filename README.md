@@ -15,6 +15,8 @@
 
 full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不可用，将官方 `dev.json` 和 `id_aliases.json` 分别放到 `ROOT/raw/2wiki_dev.json` 与 `2wiki_id_aliases.json`。官方 dev 被用作跨数据集测试，不参与训练。数据下载与建图可能耗时，应先估计 pilot 的实际吞吐。
 
+00 的原始数据单元分三段打印进度：HotpotQA/MuSiQue 下载、2Wiki 下载解压、问题规范化与证据去重。流式下载显示记录数和速度；2Wiki 显示 MiB、速度及有总大小时的 ETA。源记录总量未知时明确显示 `ETA=unknown`；网络等待时最后一条阶段消息用于定位，不能把没有新计数当作已经完成。MuSiQue 改为边读取边写临时文件，完整成功后才发布正式文件。full 在此读取完整来源，8,000/4,000 的训练抽样发生在后续 `prepare_tasks`，此单元尚不调用 DeepSeek 建图。旧版只有末尾 `manifest` 输出，执行期间可能一直空白；更新代码后重载模块或重新连接才会使用新日志，已经执行中的调用不会自动更新。
+
 旧版 notebook 若在安装后报 `ModuleNotFoundError: No module named 'sa_jev'`，是当前内核可能尚未读取 editable 安装生成的 `.pth` 路径。新版第二个代码单元会在安装后调用 `site.addsitedir()` 刷新路径，并打印 `SA-Jev source:` 以核对实际加载位置。更新 notebook 后重新运行安装单元即可；若 pip 提示已经加载的依赖需要重启，则重启会话后按顺序重跑开头的初始化单元。
 
 `00` 的 smoke 现在直接在 notebook 中执行，失败时显示原始 Python 异常。每次执行都在 `ROOT/smoke/run_*` 创建独立目录，可重复运行并保留旧结果；本地 `sajev smoke` 采用相同方式。其他 notebook CLI 命令会实时显示子进程输出，并在失败异常中附上最后 40 行，避免只看到没有内部原因的 `CalledProcessError`。smoke 通过后再继续数据准备；它使用 tiny 测试模型，不能代替 OpenJev-4B 的显存与性能验证。
@@ -37,6 +39,8 @@ HF_TOKEN=
 `00_environment_data.ipynb` 在 smoke 后新增“本地向量编码器”检查单元：自动下载、检查向量形状/归一化、打印速度和 GPU 显存，记录到 `ROOT/embedding_check.json`。Colab 权重缓存位于 `MyDrive/SA-Jev/huggingface/hub`，以后复用；已有运行时更新代码和安装单元后需重启，再按顺序初始化。主英文任务可使用该编码器；工业案例若包含非英文 OCR，应单独配置合适的多语言模型并注明检索设置，不把英文编码器结果当作多语言能力。编码器输入上限为 512 个自身 tokenizer 的 token，长输入按模型规则截断，完整候选正文保留，需在检索覆盖率中评估影响。
 
 更改编码器后旧向量索引及候选缓存必须重建，程序会拒绝混用。可在 Drive 中把旧的 `pilot/index`、`pilot/data/pools`、`pilot/data/pools_max` 重命名备份后，从 `00` 的建图单元继续，再运行后面的任务状态准备单元；原始数据无需重新下载。所有方法共享这次重建后的固定候选池，已用旧池得到的评测结果不能混入新对比。
+
+如果出现 `SafetensorError: ... header too large`，先处理编码器权重缓存，不能据此判定 CPU 不支持或显存不足。当前固定 BGE 的官方 `model.safetensors` 是 **133,466,304 bytes**，SHA-256 为 `3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad`。加载前会检查这两项；不匹配时仅将该 snapshot 权重条目改名为 `.invalid-*`，强制下载同一 revision 一次并重新校验，避免反复下载仍继续运行。这样也处理了 Drive/无符号链接缓存中旧 snapshot 文件不随 blob 强制下载而替换的情况。修复的是相同权重文件，不改变编码器与索引配置，因此原始数据、已加工状态和原有图谱不需要因此删除或重建。重试仍失败时停止并报告；不能保证修复外部 Drive 或下载链路的故障。
 
 本地验证入口：`python scripts/check_local_embeddings.py` 使用真实编码器和测试 LLM；加 `--live-llm` 则读取 `.env`，用真实聊天 API 对两篇合成文档跑原生 LightRAG 建图、混合检索和缓存检查。每次创建独立测试目录，不修改正式索引。
 

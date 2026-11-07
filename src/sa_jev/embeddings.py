@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from pathlib import Path
 import time
+from uuid import uuid4
 
 import numpy as np
 
@@ -13,6 +15,59 @@ from .io import digest, write_json
 BGE_MODEL = "BAAI/bge-small-en-v1.5"
 BGE_REVISION = "5c38ec7c405ec4b44b94cc5a9bb96e735b38267a"
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+# Official Hub LFS metadata for model.safetensors at BGE_REVISION.
+BGE_WEIGHT_BYTES = 133466304
+BGE_WEIGHT_SHA256 = "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad"
+
+
+def ensure_bge_weights(cache_folder=None):
+    """Validate the pinned small encoder; repair only its corrupt cached weight once."""
+    from huggingface_hub import hf_hub_download, constants
+
+    cache = Path(cache_folder or os.environ.get("HF_HUB_CACHE") or
+                 (str(Path(os.environ["HF_HOME"]) / "hub") if os.environ.get("HF_HOME")
+                  else constants.HF_HUB_CACHE)).expanduser().absolute()
+    snapshot = cache / ("models--" + BGE_MODEL.replace("/", "--")) / "snapshots" / BGE_REVISION
+    expected_path = snapshot / "model.safetensors"
+
+    def validate(path):
+        size = path.stat().st_size
+        if size != BGE_WEIGHT_BYTES:
+            raise ValueError(f"expected {BGE_WEIGHT_BYTES:,} bytes, got {size:,}")
+        with path.open("rb") as stream:
+            actual_hash = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual_hash != BGE_WEIGHT_SHA256:
+            raise ValueError("SHA-256 differs from the official pinned weight")
+
+    def download(force=False):
+        return Path(hf_hub_download(BGE_MODEL, "model.safetensors", revision=BGE_REVISION,
+                                   cache_dir=str(cache), force_download=force))
+
+    print(f"Checking pinned BGE weight: {expected_path}", flush=True)
+    # Inspect even a dangling snapshot link instead of treating it as a new download.
+    path = expected_path if expected_path.exists() or expected_path.is_symlink() else download()
+    try:
+        validate(path)
+    except (OSError, ValueError) as error:
+        print(f"BGE weight cache is invalid: {error}. Re-downloading the same revision once.", flush=True)
+        # HF force_download replaces the blob, but may leave an existing regular
+        # snapshot file untouched (e.g. Drive/non-symlink caches). Preserve that
+        # single entry under another name before asking HF to rebuild the pointer.
+        if path.absolute() != expected_path:
+            raise RuntimeError("Unexpected embedding cache path; refusing to move it") from error
+        if path.exists() or path.is_symlink():
+            quarantine = path.with_name(path.name + ".invalid-" + uuid4().hex[:8])
+            path.rename(quarantine)
+            print(f"Preserved invalid cache entry: {quarantine}", flush=True)
+        path = download(force=True)
+        try:
+            validate(path)
+        except (OSError, ValueError) as retry_error:
+            raise RuntimeError("Downloaded BGE weight still fails integrity validation. "
+                               "Use a fresh HF_HUB_CACHE and check the download/Drive connection; "
+                               "do not delete raw data or graph indexes.") from retry_error
+    print(f"BGE weight verified: {BGE_WEIGHT_BYTES:,} bytes, SHA-256 matches.", flush=True)
+    return path
 
 
 async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
@@ -48,6 +103,8 @@ async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
         cache = str(Path(os.environ["HF_HOME"]) / "hub")
     print(f"Loading local embedding: {model}@{revision}, device={actual_device}", flush=True)
     started = time.perf_counter()
+    if model == BGE_MODEL and revision == BGE_REVISION:
+        await asyncio.to_thread(ensure_bge_weights, cache)
     encoder = await asyncio.to_thread(
         SentenceTransformer, model, revision=revision, device=actual_device,
         cache_folder=cache, trust_remote_code=False, model_kwargs={"use_safetensors": True},

@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 import itertools
 import json
+import time
 import urllib.request
 from .io import digest, read_json, read_jsonl, write_json, write_jsonl
 from .schema import Question, TaskExample, Evidence, Pool, deduplicate
@@ -18,6 +19,40 @@ def load_raw(path):
     return read_jsonl(path) if path.suffix == ".jsonl" else iter(read_json(path))
 
 
+def _progress_rows(rows, label, *, total=None):
+    """Report real streaming progress; an unknown source length has no ETA."""
+    started = last = time.perf_counter()
+    count = 0
+    print(f"[data] {label}: starting; waiting for records...", flush=True)
+    for count, row in enumerate(rows, 1):
+        yield row
+        now = time.perf_counter()
+        if count == 1 or now - last >= 5:
+            rate = count / max(now - started, 1e-9)
+            eta = f"{max(0, total-count)/rate:.0f}s" if total else "unknown (streaming)"
+            print(f"[data] {label}: {count:,} records, {rate:.1f}/s, ETA={eta}", flush=True)
+            last = now
+    print(f"[data] {label}: finished {count:,} records in {time.perf_counter()-started:.1f}s", flush=True)
+
+
+def _copy_with_progress(source, dest, label, *, total=None):
+    started = last = time.perf_counter()
+    done = 0
+    print(f"[data] {label}: transferring...", flush=True)
+    while block := source.read(1024 * 1024):
+        dest.write(block)
+        done += len(block)
+        now = time.perf_counter()
+        if done == len(block) or now - last >= 5:
+            rate = done / max(now-started, 1e-9)
+            target = f" / {total/1024**2:.1f} MiB" if total else ""
+            eta = f"{max(0, total-done)/rate:.0f}s" if total else "unknown (no Content-Length)"
+            print(f"[data] {label}: {done/1024**2:.1f} MiB{target}, "
+                  f"{rate/1024**2:.2f} MiB/s, ETA={eta}", flush=True)
+            last = now
+    print(f"[data] {label}: transferred {done/1024**2:.1f} MiB in {time.perf_counter()-started:.1f}s", flush=True)
+
+
 def download_sources(directory, limit=None):
     """The official MuSiQue distribution includes Hotpot/2Wiki support-format data.
 
@@ -27,8 +62,11 @@ def download_sources(directory, limit=None):
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     if (directory/"download_manifest.json").exists() and read_json(directory/"download_manifest.json")["limit"] != limit:
         raise ValueError("download limit changed; use a separate pilot/full directory to avoid relabeling partial files as complete")
+    print(f"[data] Download sources: limit={limit}, destination={directory}", flush=True)
     source = "https://raw.githubusercontent.com/StonyBrookNLP/musique/main/.all_data_information.json"
-    info = json.load(urllib.request.urlopen(source))
+    print("[data] Fetching MuSiQue source list from GitHub...", flush=True)
+    with urllib.request.urlopen(source, timeout=120) as response:
+        info = json.load(response)
     wanted = ["musique_ans_train.jsonl", "musique_ans_dev.jsonl"]
     manifest = {"limit": limit, "formal": limit is None, "sources": []}
     for name in wanted:
@@ -36,21 +74,30 @@ def download_sources(directory, limit=None):
         url = "https://drive.usercontent.google.com/download?id=" + file_id + "&export=download&confirm=t"
         target = directory / name
         if not target.exists():
-            response = urllib.request.urlopen(url, timeout=120)
-            rows = []
-            for line in response:
-                if line.strip(): rows.append(json.loads(line))
-                if limit and len(rows) >= limit: break
-            write_jsonl(target, rows)
+            print(f"[data] Requesting {name} from Google Drive...", flush=True)
+            with urllib.request.urlopen(url, timeout=120) as response:
+                rows = (json.loads(line) for line in response if line.strip())
+                rows = itertools.islice(rows, limit) if limit else rows
+                write_jsonl(target, _progress_rows(rows, name))
+            print(f"[data] Saved {target} ({target.stat().st_size/1024**2:.1f} MiB)", flush=True)
+        else:
+            print(f"[data] Reusing {target} ({target.stat().st_size/1024**2:.1f} MiB)", flush=True)
         manifest["sources"].append({"path": name, "url": url})
+    print("[data] Loading Hugging Face dataset client...", flush=True)
     from datasets import load_dataset
     for split in ("train", "validation"):
         target = directory / f"hotpot_{split}.jsonl"
         if not target.exists():
+            print(f"[data] Opening HotpotQA {split} stream from Hugging Face...", flush=True)
             data = load_dataset("hotpotqa/hotpot_qa", "distractor", split=split, streaming=True)
-            write_jsonl(target, itertools.islice(data, limit) if limit else data)
+            rows = itertools.islice(data, limit) if limit else data
+            write_jsonl(target, _progress_rows(rows, target.name))
+            print(f"[data] Saved {target} ({target.stat().st_size/1024**2:.1f} MiB)", flush=True)
+        else:
+            print(f"[data] Reusing {target} ({target.stat().st_size/1024**2:.1f} MiB)", flush=True)
         manifest["sources"].append({"path": target.name, "repository": "hotpotqa/hotpot_qa", "split": split})
     write_json(directory / "download_manifest.json", manifest)
+    print("[data] HotpotQA and MuSiQue downloads complete.", flush=True)
     return manifest
 
 
@@ -63,15 +110,22 @@ def normalize_sources(raw, output, *, seed=17, family_links=()):
     for name, adapter, split in sources:
         path = raw / name
         if not path.exists(): continue
-        rows = list(load_raw(path))
-        questions.extend(adapter(row, split=split) for row in rows if row.get("answerable", True))
+        print(f"[data] Reading {path}...", flush=True)
+        rows = list(_progress_rows(load_raw(path), f"read {name}"))
+        questions.extend(adapter(row, split=split) for row in
+                         _progress_rows(rows, f"normalize {name}", total=len(rows)) if row.get("answerable", True))
+        print(f"[data] Fingerprinting {name}...", flush=True)
         provenance.append({"path": name, "records": len(rows), "sha256_content": digest(rows)})
     if not questions: raise ValueError("no dataset files found; run download_sources or supply official raw files")
+    print(f"[data] Splitting {len(questions):,} questions by family and auditing leakage...", flush=True)
     questions = split_questions(questions, family_links, seed)
     counts = audit_splits(questions)
-    write_jsonl(output / "questions.jsonl", questions)
-    corpus = deduplicate(e for q in questions for e in q.evidence)
-    write_jsonl(output / "corpus.jsonl", corpus)
+    write_jsonl(output / "questions.jsonl", _progress_rows(questions, "write questions", total=len(questions)))
+    evidence_count = sum(len(q.evidence) for q in questions)
+    corpus = deduplicate(_progress_rows((e for q in questions for e in q.evidence),
+                                       "deduplicate evidence", total=evidence_count))
+    write_jsonl(output / "corpus.jsonl", _progress_rows(corpus, "write corpus", total=len(corpus)))
+    print("[data] Fingerprinting questions/corpus and writing data manifest...", flush=True)
     manifest = {"sources": provenance, "question_fingerprint": digest(questions), "corpus_fingerprint": digest(corpus),
                 "questions": len(questions), "corpus_documents": len(corpus),
                 "splits": counts, "seed": seed, "family_links": len(family_links),
@@ -80,34 +134,43 @@ def normalize_sources(raw, output, *, seed=17, family_links=()):
     if (raw/"download_manifest.json").exists():
         manifest["download"] = read_json(raw/"download_manifest.json")
     write_json(output / "data_manifest.json", manifest)
+    print(f"[data] Normalization complete: {len(questions):,} questions, "
+          f"{len(corpus):,} unique evidence paragraphs; saved to {output}", flush=True)
     return questions, manifest
 
 
 def download_2wiki(directory):
     """Official April 2021 archive, extracted by explicit filename."""
     import zipfile
-    import shutil
     import os
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     url = "https://www.dropbox.com/s/ms2m13252h6xubs/data_ids_april7.zip?dl=1"
     archive = directory/"2wiki_official.zip"
     if not archive.exists() or not zipfile.is_zipfile(archive):
+        print("[data] Requesting official 2Wiki archive from Dropbox...", flush=True)
         partial = archive.with_suffix(".zip.part")
         with urllib.request.urlopen(url, timeout=120) as response, partial.open("wb") as f:
-            shutil.copyfileobj(response, f)
+            total = int(response.headers.get("Content-Length", "0")) or None
+            _copy_with_progress(response, f, "download 2Wiki ZIP", total=total)
+        print("[data] Checking 2Wiki ZIP...", flush=True)
         if not zipfile.is_zipfile(partial):
             raise ValueError("2Wiki download is not a complete ZIP; rerun to retry the download")
         os.replace(partial, archive)
+    else:
+        print(f"[data] Reusing {archive}", flush=True)
     with zipfile.ZipFile(archive) as z:
         for target, basename in (("2wiki_dev.json", "dev.json"), ("2wiki_id_aliases.json", "id_aliases.json")):
             names = [n for n in z.namelist() if Path(n).name == basename]
             if len(names) != 1: raise ValueError(f"expected one {basename} in the official archive")
-            if (directory/target).exists(): continue
+            if (directory/target).exists():
+                print(f"[data] Reusing {directory/target}", flush=True)
+                continue
             partial = directory / (target + ".part")
             with z.open(names[0]) as source, partial.open("wb") as dest:
-                shutil.copyfileobj(source, dest)
+                _copy_with_progress(source, dest, f"extract {target}", total=z.getinfo(names[0]).file_size)
             os.replace(partial, directory/target)
     write_json(directory/"2wiki_source.json", {"url": url, "format": "official April 2021", "split": "dev used as cross-dataset test"})
+    print("[data] 2Wiki download/extraction complete.", flush=True)
 
 
 def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False, dense=False, small_k=False):
