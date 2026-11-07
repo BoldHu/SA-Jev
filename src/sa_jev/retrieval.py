@@ -7,6 +7,7 @@ import importlib.metadata
 import os
 import re
 import time
+from urllib.parse import urlsplit, urlunsplit
 from .io import digest, read_json, write_json
 from .schema import Evidence, Pool, deduplicate
 from .embeddings import BGE_MODEL, BGE_REVISION, BGE_QUERY_PREFIX, make_embedding_func
@@ -82,10 +83,20 @@ async def make_lightrag(directory, *, llm_model="DeepSeek-V4.1-Flash", embedding
             ".env file (local), then rerun the third notebook code cell before cache_pools. "
             "Use the extraction LLM provider's key; local embeddings need no API key."
         )
+    base_url = os.environ.get("OPENAI_BASE_URL")
+    endpoint = urlsplit(base_url or "https://api.openai.com/v1")
+    visible_endpoint = urlunsplit((endpoint.scheme, endpoint.netloc.rsplit("@", 1)[-1], endpoint.path, "", ""))
+    print(f"Extraction service: {visible_endpoint}; model={llm_model}; "
+          f"credential file={os.environ.get('SAJEV_ENV_FILE', '(process environment)')}", flush=True)
+    if endpoint.hostname == "generativelanguage.googleapis.com" and llm_model.lower().startswith("deepseek"):
+        raise ValueError(
+            "Extraction endpoint/model mismatch: a DeepSeek model is configured with the Google Gemini endpoint. "
+            "Update OPENAI_BASE_URL and the matching provider key in MyDrive/SA-Jev/.env, "
+            "then rerun the environment-file cell. Do not retry corpus ingestion with this combination."
+        )
     from lightrag import LightRAG
     from lightrag.llm.openai import openai_complete_if_cache
     from lightrag.kg.shared_storage import initialize_pipeline_status
-    base_url = os.environ.get("OPENAI_BASE_URL")
 
     async def completion(prompt, system_prompt=None, history_messages=None, **kwargs):
         return await openai_complete_if_cache(llm_model, prompt, system_prompt=system_prompt,
@@ -118,6 +129,27 @@ async def make_lightrag(directory, *, llm_model="DeepSeek-V4.1-Flash", embedding
     return rag
 
 
+async def retry_failed_documents(rag):
+    """Request the native failed-document retry; never edit status files by hand."""
+    from uuid import uuid4
+    from lightrag.kg.shared_storage import (
+        commit_manual_retry_request, get_namespace_data, get_namespace_lock, get_pipeline_ingress,
+    )
+    workspace = rag.workspace
+    pipeline_status = await get_namespace_data("pipeline_status", workspace=workspace)
+    lock = get_namespace_lock("pipeline_status", workspace=workspace)
+    ingress = await get_pipeline_ingress(workspace)
+    if ingress.peek_next_manual_retry() is None:
+        refusal = await commit_manual_retry_request(
+            pipeline_status, lock, ingress, uuid4().hex, {"committed": False},
+        )
+        if refusal is not None:
+            raise RuntimeError(f"LightRAG refused failed-document retry: {_redact_error(refusal)}")
+    print("Resuming existing failed documents through LightRAG's native retry pipeline "
+          "(one retry attempt; no duplicate insertion).", flush=True)
+    await rag.apipeline_process_enqueue_documents()
+
+
 async def ingest_corpus(rag, evidence, manifest_path, config, batch_size=32):
     evidence = deduplicate(evidence)
     binding = digest({"documents": evidence, "config": config, "ingestion_format": "source_id_v2"})
@@ -129,26 +161,68 @@ async def ingest_corpus(rag, evidence, manifest_path, config, batch_size=32):
     from lightrag.base import DocStatus
     started = time.perf_counter()
     newly_processed = skipped = 0
+    retried_existing = False
     print(f"Indexing {len(evidence)} unique documents; completed documents will be reused", flush=True)
     for start in range(0, len(evidence), batch_size):
         batch = evidence[start:start+batch_size]
         statuses = await rag.doc_status.get_by_ids([e.id for e in batch])
-        pending = [e for e, status in zip(batch, statuses)
-                   if not status or status.get("status") != DocStatus.PROCESSED]
-        skipped += len(batch) - len(pending)
+        recovered = 0
+        if not retried_existing and any(status and status.get("status") == DocStatus.FAILED for status in statuses):
+            # ainsert filters every existing ID, including FAILED; resubmission
+            # alone never retries it and can create duplicate-failure records.
+            previously_incomplete = {i for i, status in enumerate(statuses)
+                                     if status and status.get("status") != DocStatus.PROCESSED}
+            await retry_failed_documents(rag)
+            retried_existing = True
+            statuses = await rag.doc_status.get_by_ids([e.id for e in batch])
+            recovered = sum(1 for i, status in enumerate(statuses)
+                            if i in previously_incomplete and status and status.get("status") == DocStatus.PROCESSED)
+        pending = [e for i, e in enumerate(batch)
+                   if i >= len(statuses) or not statuses[i] or statuses[i].get("status") != DocStatus.PROCESSED]
+        new = [e for i, e in enumerate(batch) if i >= len(statuses) or not statuses[i]]
+        skipped += len(batch) - len(pending) - recovered
         # Metadata contains stable source IDs, never question/gold/answer fields.
         # LightRAG normalizes file paths, which can strip URLs. Store stable IDs
         # here and restore full source URLs/titles from the fixed registry at retrieval.
-        if pending:
-            await rag.ainsert([e.title + "\n" + e.text for e in pending], ids=[e.id for e in pending],
-                              file_paths=[e.id for e in pending])
+        still_failed = any(status and status.get("status") == DocStatus.FAILED for status in statuses)
+        if new and not still_failed:
+            await rag.ainsert([e.title + "\n" + e.text for e in new], ids=[e.id for e in new],
+                              file_paths=[e.id for e in new])
+        elif not still_failed and any(status and status.get("status") not in {DocStatus.PROCESSED, DocStatus.FAILED}
+                 for status in statuses):
+            await rag.apipeline_process_enqueue_documents()
         statuses = await rag.doc_status.get_by_ids([e.id for e in batch])
-        failed = [e.id for e, status in zip(batch, statuses)
-                  if not status or status.get("status") != DocStatus.PROCESSED]
-        if len(statuses) != len(batch) or failed:
-            raise RuntimeError(f"LightRAG has incomplete documents (example IDs: {failed[:5]}). "
-                               "Index is NOT marked complete; resolve the API error and rerun this cell.")
-        newly_processed += len(pending)
+        failures = []
+        for i, evidence_item in enumerate(batch):
+            status = statuses[i] if i < len(statuses) else None
+            if status and status.get("status") == DocStatus.PROCESSED:
+                continue
+            status = status or {}
+            metadata = status.get("metadata") or {}
+            failures.append({"id": evidence_item.id, "status": status.get("status", "missing"),
+                             "error_msg": _redact_error(status.get("error_msg") or
+                                                        "No stored error; inspect the pipeline log and document status."),
+                             "error_type": _redact_error(metadata.get("error_type", "")),
+                             "error_stage": _redact_error(metadata.get("error_stage", ""))})
+        if len(statuses) != len(batch) or failures:
+            report_path = path.parent / "ingestion_failure.json"
+            report = {"status": "incomplete", "corpus_fingerprint": binding,
+                      "batch_start": start, "batch_size": len(batch), "returned_statuses": len(statuses),
+                      "elapsed_seconds": time.perf_counter()-started, "failures": failures}
+            details = "\n".join(f"{row['id']} [{row['status']}]: {row['error_msg'][-4000:]}"
+                                for row in failures[:3])
+            try:
+                write_json(report_path, report)
+                location = f"Details saved to {report_path}."
+            except OSError as error:
+                location = f"Could not save failure report: {_redact_error(error)}"
+            raise RuntimeError(
+                f"LightRAG has incomplete documents ({len(failures)}/{len(batch)}; "
+                f"returned {len(statuses)} status records). Index is NOT marked complete.\n"
+                f"{details}\n{location}\nResolve the reported cause before retrying. "
+                "No documents are skipped or treated as successfully indexed."
+            )
+        newly_processed += len(pending) + recovered
         done = min(start+batch_size, len(evidence))
         elapsed = time.perf_counter() - started
         rate = newly_processed / max(elapsed, 1e-9)
@@ -163,6 +237,18 @@ async def ingest_corpus(rag, evidence, manifest_path, config, batch_size=32):
               f"new={rate*60:.1f} docs/min; estimated remaining={eta_text}", flush=True)
     write_json(path, {"fingerprint": binding, "documents": len(evidence), "config": config})
     return binding
+
+
+def _redact_error(value):
+    """Keep native failure diagnostics without echoing configured service credentials."""
+    text = str(value)
+    for name in ("OPENAI_API_KEY", "HF_TOKEN", "TYPESAFE_API_KEY", "JEV_API_KEY"):
+        secret = os.environ.get(name, "")
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"'<>]+", "Bearer [REDACTED]", text)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}", "[REDACTED]", text)
+    return text
 
 
 def hard_candidates(questions, corpus, k=64, dense=False, embedding_model="sentence-transformers/all-MiniLM-L6-v2"):

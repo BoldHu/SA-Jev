@@ -27,28 +27,83 @@ def test_interrupted_writer_keeps_complete_file(tmp_path):
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_failed_ingestion_resumes_without_false_completion(tmp_path):
+def test_failed_ingestion_resumes_without_false_completion(tmp_path, monkeypatch):
     pytest.importorskip("lightrag")
     docs = [Evidence.make("a", "First paragraph."), Evidence.make("b", "Second paragraph.")]
-    statuses = {}; calls = []
+    statuses = {}; calls = []; retry_calls = []
+    monkeypatch.setenv("OPENAI_API_KEY", "private-test-credential")
 
     async def get_by_ids(ids): return [statuses.get(i) for i in ids]
 
     async def insert(texts, ids, file_paths):
         calls.append(ids)
         for i in ids: statuses[i] = {"status": "processed"}
-        if len(calls) == 1: statuses[docs[1].id] = {"status": "failed"}
+        if len(calls) == 1:
+            statuses[docs[1].id] = {"status": "failed",
+                                   "error_msg": "429 rate limit; key=private-test-credential; Bearer old-hidden-token",
+                                   "metadata": {"error_type": "RateLimitError", "error_stage": "extract"}}
+
+    async def retry(rag):
+        retry_calls.append(True)
+        for value in statuses.values():
+            if value["status"] == "failed": value["status"] = "processed"
+
+    monkeypatch.setattr("sa_jev.retrieval.retry_failed_documents", retry)
 
     rag = SimpleNamespace(doc_status=SimpleNamespace(get_by_ids=get_by_ids), ainsert=insert)
     path = tmp_path / "corpus_manifest.json"
-    with pytest.raises(RuntimeError, match="NOT marked complete"):
+    with pytest.raises(RuntimeError, match="429 rate limit") as error:
         asyncio.run(ingest_corpus(rag, docs, path, {}))
+    assert "NOT marked complete" in str(error.value)
+    assert "private-test-credential" not in str(error.value) and "old-hidden-token" not in str(error.value)
+    report = read_json(tmp_path / "ingestion_failure.json")
+    assert report["failures"][0]["id"] == docs[1].id
+    assert report["failures"][0]["error_type"] == "RateLimitError"
+    assert report["failures"][0]["error_stage"] == "extract"
+    assert "private-test-credential" not in str(report) and "old-hidden-token" not in str(report)
     assert not path.exists()
     binding = asyncio.run(ingest_corpus(rag, docs, path, {}))
-    assert calls == [[d.id for d in docs], [docs[1].id]]
+    assert calls == [[d.id for d in docs]] and retry_calls == [True]
     assert read_json(path)["fingerprint"] == binding
     assert asyncio.run(ingest_corpus(rag, docs, path, {})) == binding
-    assert len(calls) == 2
+    assert len(calls) == 1 and retry_calls == [True]
+
+
+def test_missing_status_rows_are_reported_and_never_marked_complete(tmp_path):
+    pytest.importorskip("lightrag")
+    docs = [Evidence.make("a", "First paragraph."), Evidence.make("b", "Second paragraph.")]
+    calls = []
+
+    async def get_by_ids(ids): return []
+    async def insert(texts, ids, file_paths): calls.extend(ids)
+
+    rag = SimpleNamespace(doc_status=SimpleNamespace(get_by_ids=get_by_ids), ainsert=insert)
+    with pytest.raises(RuntimeError, match="returned 0 status records"):
+        asyncio.run(ingest_corpus(rag, docs, tmp_path/"corpus_manifest.json", {}))
+    assert calls == [e.id for e in docs]
+    assert not (tmp_path/"corpus_manifest.json").exists()
+    assert {r["id"] for r in read_json(tmp_path/"ingestion_failure.json")["failures"]} == set(calls)
+
+
+def test_native_retry_that_still_fails_stops_without_duplicate_insertion(tmp_path, monkeypatch):
+    pytest.importorskip("lightrag")
+    docs = [Evidence.make("a", "First paragraph."), Evidence.make("b", "New paragraph.")]
+    retries = []
+
+    async def get_by_ids(ids):
+        return [{"status": "failed", "error_msg": "400 model format rejected"}, None]
+
+    async def forbidden_insert(*args, **kwargs):
+        raise AssertionError("do not resubmit failed IDs or add new work while retry still fails")
+
+    async def retry(rag): retries.append(True)
+
+    monkeypatch.setattr("sa_jev.retrieval.retry_failed_documents", retry)
+    rag = SimpleNamespace(doc_status=SimpleNamespace(get_by_ids=get_by_ids), ainsert=forbidden_insert)
+    with pytest.raises(RuntimeError, match="400 model format rejected"):
+        asyncio.run(ingest_corpus(rag, docs, tmp_path/"corpus_manifest.json", {}))
+    assert retries == [True]
+    assert not (tmp_path/"corpus_manifest.json").exists()
 
 
 def test_completion_marker_requires_finished_matching_stages(tmp_path):

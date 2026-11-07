@@ -71,3 +71,17 @@ def test_changed_or_legacy_index_rejected_before_loading(monkeypatch, tmp_path):
     with pytest.raises(ValueError, match="existing index has no model binding"):
         asyncio.run(make_lightrag(legacy))
     forbidden.assert_not_called()
+
+
+def test_deepseek_google_endpoint_mismatch_fails_before_model_or_api(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("OPENAI_API_KEY", "private-test-token")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://user:password@generativelanguage.googleapis.com/v1beta/openai/?key=private-test-token")
+    forbidden = AsyncMock(side_effect=AssertionError("do not load encoder for a known bad service pairing"))
+    monkeypatch.setattr("sa_jev.retrieval.make_embedding_func", forbidden)
+    with pytest.raises(ValueError, match="endpoint/model mismatch"):
+        asyncio.run(make_lightrag(tmp_path, llm_model="DeepSeek-V4.1-Flash"))
+    forbidden.assert_not_called()
+    assert not tmp_path.joinpath("index_config.json").exists()
+    text = capsys.readouterr().out
+    assert "generativelanguage.googleapis.com" in text and "DeepSeek-V4.1-Flash" in text
+    assert "password" not in text and "private-test-token" not in text
