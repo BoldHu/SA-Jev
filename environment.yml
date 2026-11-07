@@ -1,0 +1,10 @@
+name: SA-Jev
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - -e .[train,test]
+# Install the appropriate CUDA torch wheel first; see README.
+# Colab uses its GPU runtime and installs the pinned upstream dependencies.

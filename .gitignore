@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.env
+*API_KEY*
+*api_key*
+data/
+outputs/
+checkpoints/
+vendor/
+!vendor/README.md
+.cache/

@@ -1,0 +1,18 @@
+{
+  "python": "3.11.18",
+  "platform": "Windows-10-10.0.26200-SP0",
+  "packages": {
+    "torch": "2.6.0+cu118",
+    "transformers": "5.12.1",
+    "peft": "0.19.1",
+    "fla-core": null,
+    "lightrag-hku": "1.5.7",
+    "datasets": "5.1.0",
+    "numpy": "2.4.6"
+  },
+  "cuda": "11.8",
+  "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+  "gpu_total_gib": 3.99951171875,
+  "git": "uncommitted_workspace",
+  "config": null
+}
