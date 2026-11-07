@@ -50,7 +50,7 @@ def test_streamed_sources_keep_limits_reuse_and_atomic_failure(tmp_path, monkeyp
     snapshot = {p.name: p.read_bytes() for p in tmp_path.glob("*.jsonl")}
     calls.clear()
     preparation.download_sources(tmp_path, limit=2)
-    assert len(calls) == 1  # Only the small upstream source list is checked.
+    assert calls == []  # Completed downloads are reusable without any network access.
     assert {p.name: p.read_bytes() for p in tmp_path.glob("*.jsonl")} == snapshot
     text = capsys.readouterr().out
     assert "Requesting musique_ans_train" in text and "2 records" in text

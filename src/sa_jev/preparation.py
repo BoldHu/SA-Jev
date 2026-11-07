@@ -60,8 +60,17 @@ def download_sources(directory, limit=None):
     subsets, not formal training/test sets. Google Drive quota errors are surfaced.
     """
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
-    if (directory/"download_manifest.json").exists() and read_json(directory/"download_manifest.json")["limit"] != limit:
+    manifest_path = directory / "download_manifest.json"
+    previous = read_json(manifest_path) if manifest_path.exists() else None
+    if previous is not None and previous["limit"] != limit:
         raise ValueError("download limit changed; use a separate pilot/full directory to avoid relabeling partial files as complete")
+    expected = ("musique_ans_train.jsonl", "musique_ans_dev.jsonl", "hotpot_train.jsonl", "hotpot_validation.jsonl")
+    if previous and {row["path"] for row in previous.get("sources", [])} == set(expected) and all(
+            (directory / name).is_file() and (directory / name).stat().st_size for name in expected):
+        for name in expected:
+            print(f"[data] Reusing {directory/name}", flush=True)
+        print("[data] All source downloads already complete; no network request needed.", flush=True)
+        return previous
     print(f"[data] Download sources: limit={limit}, destination={directory}", flush=True)
     source = "https://raw.githubusercontent.com/StonyBrookNLP/musique/main/.all_data_information.json"
     print("[data] Fetching MuSiQue source list from GitHub...", flush=True)
@@ -101,11 +110,49 @@ def download_sources(directory, limit=None):
     return manifest
 
 
-def normalize_sources(raw, output, *, seed=17, family_links=()):
+def normalize_sources(raw, output, *, seed=17, family_links=(), reuse=True, load_questions=True):
+    """Reuse completed unchanged artifacts; optionally return None instead of loading questions.
+
+    File size/mtime stamps provide a fast local cache check, not a cryptographic
+    re-audit. Set reuse=False after external edits that preserve those attributes.
+    """
     raw, output = Path(raw), Path(output)
+    family_links = tuple(tuple(pair) for pair in family_links)
     sources = [("hotpot_train.jsonl", hotpot, "train"), ("hotpot_validation.jsonl", hotpot, "dev"),
                ("musique_ans_train.jsonl", musique, "train"), ("musique_ans_dev.jsonl", musique, "dev"),
                ("2wiki_dev.json", twowiki, "test"), ("2wiki_dev.jsonl", twowiki, "test")]
+
+    def stamps(directory, names):
+        result = {}
+        for name in names:
+            path = directory / name
+            if path.is_file():
+                stat = path.stat()
+                result[name] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        return result
+
+    download = read_json(raw/"download_manifest.json") if (raw/"download_manifest.json").exists() else None
+    source_names = [name for name, _, _ in sources]
+    inputs = {"version": 1, "seed": seed, "family_links": digest(family_links), "download": download,
+              "source_files": stamps(raw, source_names),
+              "adapter_code": digest([(Path(__file__).parent/name).read_text(encoding="utf-8")
+                                      for name in ("data.py", "schema.py")])}
+    artifacts = ("questions.jsonl", "corpus.jsonl")
+    manifest_path = output / "data_manifest.json"
+    if reuse and manifest_path.is_file():
+        previous = read_json(manifest_path)
+        cached = previous.get("normalization_cache", {})
+        current_outputs = stamps(output, artifacts)
+        if (cached.get("inputs") == inputs and len(current_outputs) == len(artifacts)
+                and cached.get("outputs") == current_outputs):
+            print("[data] Reusing completed normalization: source/config/output stamps match. "
+                  "Skipping raw parsing, splitting, deduplication and rewriting.", flush=True)
+            questions = None
+            if load_questions:
+                questions = [Question.from_dict(row) for row in _progress_rows(
+                    read_jsonl(output/"questions.jsonl"), "load cached questions", total=previous["questions"])]
+            return questions, previous
+        print("[data] Normalization cache missing or changed; rebuilding (legacy manifests require one rebuild).", flush=True)
     questions, provenance = [], []
     for name, adapter, split in sources:
         path = raw / name
@@ -131,12 +178,15 @@ def normalize_sources(raw, output, *, seed=17, family_links=()):
                 "splits": counts, "seed": seed, "family_links": len(family_links),
                 "corpus_protocol": "union of raw source paragraphs; no answers, decompositions or support labels indexed",
                 "scope": "bounded benchmark corpus, not full Wikipedia; report this corpus scope explicitly"}
-    if (raw/"download_manifest.json").exists():
-        manifest["download"] = read_json(raw/"download_manifest.json")
-    write_json(output / "data_manifest.json", manifest)
+    if download is not None:
+        manifest["download"] = download
+    if stamps(raw, source_names) != inputs["source_files"]:
+        raise RuntimeError("Raw source files changed during normalization; rerun before using these artifacts")
+    manifest["normalization_cache"] = {"inputs": inputs, "outputs": stamps(output, artifacts)}
+    write_json(manifest_path, manifest)
     print(f"[data] Normalization complete: {len(questions):,} questions, "
           f"{len(corpus):,} unique evidence paragraphs; saved to {output}", flush=True)
-    return questions, manifest
+    return questions if load_questions else None, manifest
 
 
 def download_2wiki(directory):
@@ -145,6 +195,13 @@ def download_2wiki(directory):
     import os
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
     url = "https://www.dropbox.com/s/ms2m13252h6xubs/data_ids_april7.zip?dl=1"
+    provenance = {"url": url, "format": "official April 2021", "split": "dev used as cross-dataset test"}
+    source_path = directory / "2wiki_source.json"
+    if source_path.is_file() and read_json(source_path) == provenance and all(
+            (directory/name).is_file() and (directory/name).stat().st_size
+            for name in ("2wiki_dev.json", "2wiki_id_aliases.json")):
+        print("[data] Reusing completed 2Wiki extraction; no download or unzip needed.", flush=True)
+        return
     archive = directory/"2wiki_official.zip"
     if not archive.exists() or not zipfile.is_zipfile(archive):
         print("[data] Requesting official 2Wiki archive from Dropbox...", flush=True)
@@ -169,7 +226,7 @@ def download_2wiki(directory):
             with z.open(names[0]) as source, partial.open("wb") as dest:
                 _copy_with_progress(source, dest, f"extract {target}", total=z.getinfo(names[0]).file_size)
             os.replace(partial, directory/target)
-    write_json(directory/"2wiki_source.json", {"url": url, "format": "official April 2021", "split": "dev used as cross-dataset test"})
+    write_json(source_path, provenance)
     print("[data] 2Wiki download/extraction complete.", flush=True)
 
 
