@@ -15,7 +15,7 @@ except ImportError:
     DRIVE = Path(os.environ.get('SAJEV_WORKDIR', '../outputs/colab_local')).resolve()
     PROJECT = Path.cwd().parent if Path.cwd().name == 'notebooks' else Path.cwd()
 DRIVE.mkdir(parents=True, exist_ok=True)
-REPO_URL = os.environ.get('SAJEV_REPO_URL', '')  # Set your own repository URL to enable Git sync.
+REPO_URL = os.environ.get('SAJEV_REPO_URL', 'https://github.com/BoldHu/SA-Jev.git')  # Override with SAJEV_REPO_URL if needed.
 SYNC_GIT = True
 if not PROJECT.exists():
     if REPO_URL:

@@ -6,7 +6,7 @@
 
 主入口是 `notebooks/`，代码复用 `src/sa_jev/`。每个 notebook 都挂载 Drive、支持 Git 快进同步、初始化相同依赖；模型、候选缓存、原始结果、CSV 与 PNG/PDF 保存到 `MyDrive/SA-Jev/{pilot,full}`。
 
-1. 将 `artifacts/sa-jev-source.zip` 放到 `MyDrive/SA-Jev/`，或设置 `SAJEV_REPO_URL` 为你的代码仓库。当前目录原先没有 Git 仓库，本实现不替你创建远端。
+1. 每个 notebook 第一个代码单元的 `REPO_URL` 默认指向 `https://github.com/BoldHu/SA-Jev.git`，运行时自动克隆并同步代码，可通过环境变量 `SAJEV_REPO_URL` 覆盖。如需使用 ZIP，将 `REPO_URL` 改为 `''`，并将 `artifacts/sa-jev-source.zip` 放到 `MyDrive/SA-Jev/`。
 2. Colab 打开 `00_environment_data.ipynb`。保持 `MODE='pilot'`，先检查 tiny 流程，再下载小样本、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。配置 Colab Secrets：抽取/嵌入/回答服务使用 `OPENAI_API_KEY`，可选 `OPENAI_BASE_URL`；官方 Jev 使用 `TYPESAFE_API_KEY`；可选 `HF_TOKEN`。密钥不会进入结果文件。
 3. 运行 `01_original_diagnostics.ipynb`，先看重复调用与 K 扩展。独立无关扰动部分需要完成核验的测试包，不会用生成草稿冒充结果。
 4. 在单卡 A100 上依次运行 `02_stage1.ipynb`、`03_stage2.ipynb`。pilot 默认各两个 optimizer step。检查 loss、梯度、实测显存、checkpoint 重载和 ETA，再决定 full。
