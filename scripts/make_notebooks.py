@@ -46,6 +46,16 @@ subprocess.run([sys.executable, '-m', 'pip', 'install', '-e', '.[train,retrieval
 subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', '-e', 'vendor/OpenJev'], check=True)
 if 'google.colab' in sys.modules:
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'fla-core==0.5.2'], check=True)
+# Activate editable-install .pth files in this already-running notebook kernel.
+import importlib, site
+site_dirs = site.getsitepackages()
+if site.ENABLE_USER_SITE:
+    site_dirs.append(site.getusersitepackages())
+for site_dir in dict.fromkeys(site_dirs):
+    site.addsitedir(site_dir)
+importlib.invalidate_caches()
+import sa_jev
+print('SA-Jev source:', sa_jev.__file__)
 # If package installation asks for a runtime restart, restart before importing torch.
 from sa_jev.experiments import load_config, environment_manifest
 config = load_config()
