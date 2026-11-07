@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from urllib.parse import urlsplit
 import os
 import time
 import torch
@@ -66,21 +67,30 @@ class Answerer:
         from openai import OpenAI
         self.client = OpenAI()
         self.model = model; self.seed = seed
+        # Google's OpenAI-compatible endpoint rejects seed rather than ignoring it.
+        self.request_options = {"temperature": 0}
+        if urlsplit(str(self.client.base_url)).hostname != "generativelanguage.googleapis.com":
+            self.request_options["seed"] = seed
+        # Provider changes must not reuse an answer cached under the same model alias.
+        self.endpoint_hash = digest(str(self.client.base_url).rstrip("/"))
         self.cache = Path(cache_directory); self.cache.mkdir(parents=True, exist_ok=True)
 
     def __call__(self, state):
         payload = {"question": state.question, "conditions": state.conditions,
                    "evidence": [{"id": e.id, "title": e.title, "text": e.text} for e in state.selected]}
-        key = digest({"payload": payload, "model": self.model, "seed": self.seed, "temperature": 0, "prompt_version": 1})
+        key = digest({"payload": payload, "model": self.model, "seed": self.seed,
+                      "request_options": self.request_options, "endpoint_hash": self.endpoint_hash,
+                      "prompt_version": 1})
         path = self.cache / (key + ".json")
         if path.exists(): return read_json(path)
         import json
-        response = self.client.chat.completions.create(model=self.model, temperature=0, seed=self.seed,
+        response = self.client.chat.completions.create(model=self.model, **self.request_options,
             messages=[{"role": "system", "content": "Answer the question using only the supplied evidence. Return only the short answer. If evidence is insufficient, return noanswer."},
                       {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
         result = {"answer": response.choices[0].message.content.strip(), "model": response.model,
                   "input_tokens": response.usage.prompt_tokens, "output_tokens": response.usage.completion_tokens,
-                  "selected_ids": list(state.selected_ids)}
+                  "selected_ids": list(state.selected_ids), "request_options": self.request_options,
+                  "endpoint_hash": self.endpoint_hash}
         write_json(path, result); return result
 
 

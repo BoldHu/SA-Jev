@@ -7,6 +7,7 @@ import gc
 import os
 import platform
 import subprocess
+import time
 import importlib.metadata
 import torch
 import yaml
@@ -31,7 +32,7 @@ def read_questions(root):
 
 def environment_manifest(output, config=None):
     packages = {}
-    for p in ("torch", "transformers", "peft", "fla-core", "lightrag-hku", "datasets", "numpy"):
+    for p in ("torch", "transformers", "peft", "fla-core", "lightrag-hku", "sentence-transformers", "datasets", "numpy"):
         try: packages[p] = importlib.metadata.version(p)
         except importlib.metadata.PackageNotFoundError: packages[p] = None
     try: git = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL).strip()
@@ -55,12 +56,25 @@ async def cache_pools(root, config, limit=None):
         cache = PoolCache(data/"pools_max")
         main = PoolCache(data/"pools")
         source_registry = {e.id:e for e in corpus}
+        started = time.perf_counter()
+        fresh = 0
         for i, q in enumerate(questions):
+            cached = cache.path(q.id).exists()
             pool = await retrieve_once(rag, q.id, q.question, cfg["max_k"], cache, corpus_fingerprint=binding,
                                        mode=cfg["mode"], extra={"max_total_tokens": 180000, "max_entity_tokens": 20000, "max_relation_tokens": 20000},
                                        source_registry=source_registry)
             main.write(slice_pool(pool, config["data"]["main_k"]))
-            print(f"cached {i+1}/{len(questions)} actual K={len(pool.candidates)}", flush=True)
+            fresh += int(not cached)
+            elapsed = time.perf_counter() - started
+            eta = (len(questions)-i-1) * elapsed / fresh if fresh else None
+            eta_text = f"{eta/3600:.2f} h" if eta is not None else "unknown (cache only)"
+            print(f"cached {i+1}/{len(questions)} actual K={len(pool.candidates)}; "
+                  f"remaining query ETA={eta_text}", flush=True)
+        write_json(data / "pool_cache_manifest.json", {
+            "complete": limit is None, "questions": len(questions), "corpus_binding": binding,
+            "question_fingerprint": read_json(data / "data_manifest.json")["question_fingerprint"],
+            "config_fingerprint": digest({"retrieval": cfg, "main_k": config["data"]["main_k"]}),
+        })
     finally: await rag.finalize_storages()
 
 

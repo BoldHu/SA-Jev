@@ -1,6 +1,7 @@
 """Load service credentials from one local or Drive .env file without logging values."""
 from pathlib import Path
 import os
+import sys
 from dotenv import dotenv_values
 
 
@@ -30,3 +31,24 @@ def load_environment(path, *, template=None):
         os.environ["TYPESAFE_API_KEY"] = os.environ["JEV_API_KEY"]
     os.environ["SAJEV_ENV_FILE"] = str(path)
     return {key: bool(os.environ.get(key)) for key in CREDENTIAL_KEYS}
+
+
+def disconnect_after_preparation(root, *, run_id, enabled=True):
+    """Flush Drive, then release Colab only after this run's preparation succeeded."""
+    if not enabled:
+        print("Automatic disconnect disabled.", flush=True)
+        return False
+    if "google.colab" not in sys.modules:
+        print("Not running in Colab; automatic disconnect skipped.", flush=True)
+        return False
+    from .io import read_json
+    marker = read_json(Path(root) / "00_complete.json")
+    if not run_id or marker.get("run_id") != run_id or marker.get("status") != "data_preparation_complete":
+        raise RuntimeError("This run has not completed preparation; keeping the runtime connected.")
+    from google.colab import drive, runtime
+    print("00 complete. Flushing Drive writes before releasing this runtime...", flush=True)
+    # Do not release the VM if flushing fails. Transient /content files are not retained.
+    drive.flush_and_unmount()
+    print("Drive flushed. Releasing the Colab runtime.", flush=True)
+    runtime.unassign()
+    return True

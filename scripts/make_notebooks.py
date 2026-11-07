@@ -93,27 +93,39 @@ if not credential_status['OPENAI_API_KEY']:
 
 def create(name, title, content):
     notebook = nbf.v4.new_notebook()
-    notebook.cells = [nbf.v4.new_markdown_cell(title), nbf.v4.new_code_cell(BOOT),
+    boot = BOOT
+    if name == '00_environment_data.ipynb':
+        boot = BOOT.replace("MODE = 'pilot'  # Change to 'full' only after the pilot completes and memory is measured.",
+                            "MODE = 'pilot'  # Use 'full' after the pilot; separate Drive directories.\n"
+                            "AUTO_DISCONNECT = True  # Release Colab after successful preparation and Drive flush.\n"
+                            "from uuid import uuid4\nPREPARATION_RUN_ID = uuid4().hex")
+    notebook.cells = [nbf.v4.new_markdown_cell(title), nbf.v4.new_code_cell(boot),
                       nbf.v4.new_code_cell(INSTALL), nbf.v4.new_code_cell(ENVIRONMENT)]
     for kind, text in content:
         notebook.cells.append(nbf.v4.new_markdown_cell(text) if kind == 'md' else nbf.v4.new_code_cell(text))
     notebook.metadata = {"kernelspec": {"display_name":"Python 3", "language":"python", "name":"python3"},
                          "language_info":{"name":"python"}, "colab":{"name":name}, "accelerator":"GPU"}
+    if name == '00_environment_data.ipynb':
+        notebook.metadata.pop('accelerator', None)  # CPU is sufficient for data preparation.
     target=ROOT/'notebooks'/name; target.parent.mkdir(exist_ok=True)
     nbf.write(notebook,target)
 
 
-create('00_environment_data.ipynb', '# SA-Jev · 环境与数据准备\n先跑 pilot。正式训练数据约 8,000 HotpotQA + 4,000 MuSiQue；每题最多 3 个状态。所有模型输入排除答案、分解和 gold 标签。', [
+create('00_environment_data.ipynb', '# SA-Jev · 环境与数据准备\n先运行 MODE=pilot，产物保存到 MyDrive/SA-Jev/pilot；改为 full 后另存 full 目录。CPU 可运行，不训练 OpenJev-4B。pilot 每个源文件 64 条，不是完整论文数据，也不下载 2Wiki。流程成功生成本次 00_complete.json 后，默认刷新 Drive 写入并释放 Colab 运行时。首个代码单元的 AUTO_DISCONNECT=False 可关闭自动断开。', [
 ('code', "import torch\nfrom sa_jev.smoke import run_fresh\n# Execute in the notebook so any failure shows its original traceback.\nsmoke_result = run_fresh(ROOT, device='cuda' if torch.cuda.is_available() else 'cpu')\nsmoke_result"),
+('md', '本地向量编码器：首次运行下载固定版本的 BAAI/bge-small-en-v1.5（384 维），缓存到 Drive/huggingface；之后复用。此检查不调用 API，自动使用 GPU，无 GPU 时用 CPU。文本抽取与最终回答继续使用 LLM API。'),
+('code', "from sa_jev.embeddings import check_embeddings\nembedding_check = await check_embeddings(config['retrieval'], ROOT/'embedding_check.json')\nembedding_check"),
 ('md', '下载原始数据：pilot 每个文件 64 条；full 读取完整源。2Wiki 的官方 dev.json 另置于 ROOT/raw/2wiki_dev.json。MuSiQue 两种官方格式均受支持。'),
 ('code', "from sa_jev.preparation import download_sources, download_2wiki, normalize_sources\ndownload_sources(ROOT/'raw', limit=64 if MODE=='pilot' else None)\nif MODE=='full':\n    download_2wiki(ROOT/'raw')\nquestions, manifest = normalize_sources(ROOT/'raw', ROOT/'data')\nmanifest"),
-('md', '固定 LightRAG 混合召回。原始段落统一入库，不索引答案或标签。此步骤会调用所配置的抽取与嵌入服务；先检查 configs/research.yaml。首次建图通常比训练 pilot 更耗时。'),
+('md', '固定 LightRAG 混合召回。原始段落统一入库，不索引答案或标签。向量使用本地 BGE 编码器，文本抽取调用 LLM API。先检查 configs/research.yaml。旧 API 向量索引不能复用；切换建图模型或编码器后使用新的实验 ROOT，重建索引和候选池。首次建图通常比训练 pilot 更耗时。'),
 ('code', "from sa_jev.experiments import cache_pools\nawait cache_pools(ROOT, config)"),
 ('code', "from sa_jev.preparation import prepare_tasks\nprepare_tasks(ROOT/'data', counts=config['data']['train_counts'], mine=True, dense=config['data']['dense_mining'])"),
 ('md', '训练前完整扫描公开 OpenJevData。检出的重叠保留记录并在论文报告；未检出不代表证明完全未见。此步骤不使用独立扰动测试集调参。'),
 ('code', "cli('overlap')\ncli('review-packets')"),
-('code', "from sa_jev.io import read_json\nread_json(ROOT/'data/task_manifest.json')"),
-('md', '核对实际 K 分布和有效标签数量。缺候选不复制补齐，未知相关性不硬判负例。若排序有效状态太少，核查候选注释映射/补充核验，不能把掩码简单删掉。把独立扰动草稿人工核验后保存为 perturbations_reviewed.jsonl。')])
+('code', "from sa_jev.preparation import finish_preparation\ncompletion = finish_preparation(ROOT, config, mode=MODE, run_id=PREPARATION_RUN_ID)\ncompletion"),
+('md', '核对实际 K 分布和有效标签数量。缺候选不复制补齐，未知相关性不硬判负例。若排序有效状态太少，核查候选注释映射/补充核验，不能把掩码简单删掉。把独立扰动草稿人工核验后保存为 perturbations_reviewed.jsonl。'),
+('md', '结束后自动断开：只有本次运行已成功完成才执行。先刷新并卸载 Drive，再释放 Colab 运行时。Drive 刷新失败或流程失败时不主动释放；重新连接需重装环境并挂载 Drive，已保存数据保留。本地运行会跳过此步骤。'),
+('code', "from sa_jev.environment import disconnect_after_preparation\ndisconnect_after_preparation(ROOT, run_id=PREPARATION_RUN_ID, enabled=AUTO_DISCONNECT)")])
 
 create('01_original_diagnostics.ipynb', '# 原模型诊断\n先测重复调用噪声，再测无关上下文与大 K；不预设原模型不稳定。', [
 ('code', "from sa_jev.experiments import diagnostics_experiment, efficiency_experiment\ndiagnostics_experiment(ROOT, config, limit=8 if MODE=='pilot' else 100)\nefficiency_experiment(ROOT, config, limit=8 if MODE=='pilot' else 100)"),

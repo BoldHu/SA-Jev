@@ -1,15 +1,27 @@
 # 实际验证记录
 
-日期：2026-11-07（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
+日期：2026-11-07 至 2026-11-08（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
 
 ## 已运行
 
 | 检查 | 实际结果 | 可追溯输出 |
 |---|---|---|
 | Conda 环境 | 新建 `SA-Jev`；Python 3.11.18、PyTorch 2.6.0+cu118；RTX 3050 Laptop 4GB 可用 | `docs/validation_environment.json` |
-| 测试套件 | 本次 **23 passed，1 failed**（约 81.89s）；唯一失败是本地 `00` notebook 保留用户运行输出，不满足源码 notebook 应无输出的检查；未删除用户日志。smoke 重入、子进程错误显示与环境文件检查均通过 | `python -m pytest -q` |
+| 此前完整测试套件 | **23 passed，1 failed**（约 81.89s）；唯一失败是本地 `00` notebook 保留用户运行输出，不满足源码 notebook 应无输出的检查；未删除用户日志。smoke 重入、子进程错误显示与环境文件检查均通过 | `python -m pytest -q` |
+| 全量准备前回归检查 | 本次 **29 passed，1 deselected**（49.30s）；包括失败写入不覆盖完整文件、失败建图不写完成标记、重跑仅补未完成文档、00 完成标记的前置条件。跳过要求用户 notebook 输出为空的旧检查；9 个 notebook 的格式及代码语法另行通过。未跑真实全量语料 | `pytest -q -k "not notebook_cells_parse_and_outputs_empty"` |
+| pilot 默认值与结束自动释放 | 本次 **9 passed**（6.94s）：环境文件、准备完成/恢复及自动断开相关检查通过；模拟 Colab 验证本次完成标记校验、先刷新 Drive 后释放、刷新失败不释放、本地跳过。9 个 notebook 格式及代码语法通过，保留 00 原有用户输出。默认恢复 pilot，00 不默认请求 GPU。未在真实 Colab 会话执行释放 | `pytest -q tests/test_colab_disconnect.py tests/test_preparation_resume.py tests/test_environment.py` |
+| 本地向量相关测试 | 本次 **6 passed，1 deselected**（13.35s）；验证本地编码不调用 embedding API、查询/文档前缀、候选向量顺序、并发序列化及旧索引拒绝混用。跳过要求用户 notebook 输出为空的检查；另对全部 9 个 notebook 实际通过 nbformat 与代码语法验证 | `pytest -q tests/test_local_embeddings.py tests/test_protocol_integration.py -k "not notebook_cells_parse_and_outputs_empty"` |
 | smoke 重复运行 | RTX 3050 上连续两次完整 tiny smoke：每次 Stage 1/2 各 2 步、检查点重载通过、评测错误 0；各自独立目录，第一次检查点字节保持不变 | `outputs/notebook_smoke_reentry/verification.json` |
 | 中转站模型检查 | 使用用户配置的服务令牌查询模型列表返回 200，包含 `gemini-3.1-flash-lite`，不包含 `text-embedding-3-small`；Gemini 小请求返回 401；embedding 小请求返回 503（当前分组无可用通道）。仅确认模型名称与当前失败状态，未宣称接口调用成功 | `outputs/relay_model_check/verification.json` |
+| Gemini 3 Flash Preview 试调用 | 同一中转站与令牌：模型列表返回 200，包含 `gemini-3-flash-preview`；聊天请求仍返回 401 `Invalid token`，未获得文本。配置已切换，不能据此声称生成可用；本次未重复调用 embedding | `outputs/relay_gemini3_flash_check/verification.json` |
+| AutoDL DeepSeek 试调用 | 使用更新后的 `.env`：模型列表 200，包含 `DeepSeek-V4.1-Flash`；聊天请求 200，正文 `OK`，耗时 4.187 秒，服务返回模型名 `DeepSeek-Flash`，usage 为 48 tokens。向量最小请求 `/api/v1/embeddings` 返回 404；聊天连通，不代表 LightRAG 全链路通过。配置已改用请求模型名，未独立验证服务后端权重身份 | `outputs/api_deepseek_v41_flash_check/verification.json` |
+| Google Gemini 2.5 Flash-Lite 试调用 | 更新后的 Google 官方兼容接口模型列表返回 200，含 `models/gemini-2.5-flash-lite`。带 `seed` 的聊天请求返回 400（不接受该参数）；去掉后返回 404，明确该模型不再向新用户开放。未获得生成文本；服务错误信息建议 `gemini-3.5-flash-lite`，其后续独立测试见下一行。回答器已对 Google 接口省略 `seed`，并按服务地址隔离缓存 | `outputs/api_google_gemini25_flash_lite_check/verification.json` |
+| Google Gemini 3.5 Flash-Lite 试调用 | 请求返回 200，正文 `OK.`，响应模型名 `gemini-3.5-flash-lite`，耗时 1.343 秒，usage 共 7 tokens；项目实际 Answerer 根据合成证据返回 `London`，83 tokens，缓存重读一致。已将建图/回答默认模型及环境模板切换到 Google 官方兼容接口 | `outputs/api_google_gemini35_flash_lite_check/verification.json` |
+| 本地 BGE + 真实 Gemini + 原生 LightRAG | 在独立目录用两篇合成文档实际完成建图、`mix` 查询、来源还原与固定缓存重读，返回 2 个候选；未使用旧 DeepSeek 索引或候选池。全部向量由固定版本本地 BGE 生成。仅是微型联调，不是论文性能或正式训练验证 | `outputs/google_gemini35_lightrag_check/run_j4geu2_9/verification.json` |
+| 本地 BGE 编码器 | 实际下载 `BAAI/bge-small-en-v1.5` 固定 revision 的 safetensors（133,466,304 bytes）；RTX 3050 上生成 384 维归一化向量，2 文档 + 1 查询的小测试峰值 reserved 0.158203125 GiB。另在 `HF_HUB_OFFLINE=1` 且无 API key 的 CPU 进程中验证缓存加载与编码成功 | `outputs/local_embedding_check/run_et0opc_q/encoder.json`、`outputs/local_embedding_check/cpu_offline.json` |
+| 本地 BGE + 真实 DeepSeek + 原生 LightRAG | 两篇合成文档实际建图、`mix` 查询、来源还原与固定缓存重读通过，返回 2 个候选；流程耗时 28.94 秒（含一次 API 超时后重试恢复）。全部向量由本地编码器生成。使用测试 LLM 的独立运行亦通过。仅是微型联调，未估计正式数据建图成本或论文性能 | `outputs/local_embedding_check/run_et0opc_q/verification.json`、`outputs/local_embedding_check/run_ernui78a/verification.json` |
+| 最终 DeepSeek 复测与配置 | 用户最终选择 `DeepSeek-V4.1-Flash`。最小聊天请求 200、`OK`、3.687 秒，服务返回名 `DeepSeek-Flash`；更新后的持久化/状态检查代码实际跑通两文档建图、混合查询和候选缓存，流程 33.45 秒，返回 2 候选。默认模型与模板恢复为 AutoDL DeepSeek，00 默认 full 数据准备；此微型耗时不能外推全量 | `outputs/deepseek_final_check/verification.json`、`outputs/deepseek_final_lightrag_check/run_b2fhpk6a/verification.json` |
+| 2Wiki 全量入口预检 | 官方 ZIP 链接实际返回 HTTP 200、ZIP 文件头正确，响应长度 258,968,175 bytes；仅读取文件头，未声称完整下载、解压或正式全量处理通过 | 官方下载地址在 `src/sa_jev/preparation.py` |
 | 真实小数据完整路径 | 下载 HotpotQA train/dev、作者 MuSiQue answerable train/dev 各 8 条；选其中小部分作流程测试，12 个训练状态、6 个验证状态、6 对轨迹；Stage 1 与 Stage 2 各实际更新 2 步；2 题动态评测无运行错误 | `outputs/real_smoke_final/verification.json` |
 | 检查点重载 | tiny 编码器 + **实际上游** DecisionHead/OptionSetInteractor 的保存、重载预测一致 | 同上及 `stage1/step_000002/` |
 | 随机小 Qwen3.5 | 103,936 参数，包含 linear/full attention；CPU 和 CUDA 均完成原生 adapter + PEFT LoRA + 原生 interactor/head 的反传及 optimizer 更新 | `outputs/qwen_lora_check.json`、`outputs/qwen_lora_cuda.json` |
@@ -41,11 +53,11 @@
 ## 仍需在 Colab/真实服务运行
 
 1. **OpenJev-4B 发布权重 + FLA 0.5.2 + A100**：代表性长状态/长轨迹的前向、反向、显存与吞吐；确认单卡峰值满足约束后才正式训练。
-2. 完整 8k/4k 数据准备、全部 OpenJevData 扫描、实际 K/有效监督覆盖核查；必要时对未知候选补可核验注释。真实 LightRAG 的抽取/嵌入服务尚未调用。
-3. 官方 Jev API、真实回答模型的接入与测量；中转站 Gemini/embedding 的最小请求已测试但未通过，需先解决通道鉴权和嵌入模型权限。未读取或使用 `JEV_API_KEY.txt`，也未调用官方 Jev API。
+2. 完整 8k/4k 数据准备、全部 OpenJevData 扫描、实际 K/有效监督覆盖核查；必要时对未知候选补可核验注释。本地 BGE 分别搭配真实 DeepSeek、Gemini 的微型 LightRAG 全链路已通过；仍需在真实 pilot 语料上测量召回覆盖、建图耗时和 API 成本。
+3. 官方 Jev API、真实回答模型的正式数据测量；最终采用的 AutoDL DeepSeek 已完成最后一次聊天及小规模建图复测，向量使用本地编码器。此前 Google Gemini 的接口验证保留为历史记录。未读取或使用 `JEV_API_KEY.txt`，也未调用官方 Jev API。
 4. 原模型上下文干扰与 K 诊断、三个种子的两阶段训练、共享缓存主对比及 2Wiki 跨数据集评测。
 5. 人工核验约 600 个独立状态的 3 个无关扰动与 1 个有效变化；本次没有生成或声称已有 600 份核验结果。
 6. DPO/稳定性/完整模型/无状态更新/小 K/权重消融；K=16…256 的实测质量、延迟、token、显存及失败比例。
 7. ViDoRe 官方 OCR 流式列读取、真实检索及有来源的成功/失败案例。本次只核对了官方字段与指定 revision，没有运行工业案例结论。
 
-没有正式训练权重、论文指标、显著性或“优于基线”的结论。Colab 首次顺序见根 README：00 → 01 → 02 → 03 → 04；pilot 确认后在 full 根目录重做，最后 05–08。
+没有正式训练权重、论文指标、显著性或“优于基线”的结论。Colab 顺序见根 README：00 pilot → 01–04 用少量问题/步骤验证 4B 路径 → 00 full 准备一次 → 正式 01–04 → 05–08。已经完成的 full 主实验数据与固定候选缓存不需要再建一次；独立扰动人工核验、小 K 消融派生数据和 ViDoRe 工业案例仍在后续步骤完成。00 pilot 与 4B pilot 均尚未完整实测，不承诺固定耗时。

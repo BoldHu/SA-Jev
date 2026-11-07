@@ -6,8 +6,10 @@ from pathlib import Path
 import importlib.metadata
 import os
 import re
+import time
 from .io import digest, read_json, write_json
 from .schema import Evidence, Pool, deduplicate
+from .embeddings import BGE_MODEL, BGE_REVISION, BGE_QUERY_PREFIX, make_embedding_func
 
 
 class PoolCache:
@@ -68,19 +70,20 @@ async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fin
     return pool
 
 
-async def make_lightrag(directory, *, llm_model="gemini-3.1-flash-lite", embedding_model="text-embedding-3-small",
-                        embedding_dim=1536, chunk_tokens=512, chunk_overlap=64):
-    """Use native ingestion and mixed retrieval; callers supply credentials via env."""
+async def make_lightrag(directory, *, llm_model="DeepSeek-V4.1-Flash", embedding_model=BGE_MODEL,
+                        embedding_dim=384, embedding_backend="local", embedding_revision=BGE_REVISION,
+                        embedding_device="auto", embedding_batch_size=16, embedding_max_length=512,
+                        embedding_query_prefix=BGE_QUERY_PREFIX, chunk_tokens=512, chunk_overlap=64):
+    """Native mixed retrieval with a frozen local encoder and an API extraction LLM."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise ValueError(
             "OPENAI_API_KEY is missing. Fill it in MyDrive/SA-Jev/.env (Colab) or the project "
             ".env file (local), then rerun the third notebook code cell before cache_pools. "
-            "Use the extraction/embedding provider's key; a Jev or Hugging Face token is not a substitute."
+            "Use the extraction LLM provider's key; local embeddings need no API key."
         )
     from lightrag import LightRAG
-    from lightrag.llm.openai import openai_complete_if_cache, openai_embed
-    from lightrag.utils import EmbeddingFunc
+    from lightrag.llm.openai import openai_complete_if_cache
     from lightrag.kg.shared_storage import initialize_pipeline_status
     base_url = os.environ.get("OPENAI_BASE_URL")
 
@@ -88,14 +91,28 @@ async def make_lightrag(directory, *, llm_model="gemini-3.1-flash-lite", embeddi
         return await openai_complete_if_cache(llm_model, prompt, system_prompt=system_prompt,
                     history_messages=history_messages or [], api_key=api_key, base_url=base_url, **kwargs)
 
-    async def embed(texts):
-        # Upstream decorates openai_embed with EmbeddingFunc; use its underlying
-        # function so the configured embedding dimensions are applied once.
-        fn = getattr(openai_embed, "func", openai_embed)
-        return await fn(texts, model=embedding_model, api_key=api_key, base_url=base_url, embedding_dim=embedding_dim)
-
-    rag = LightRAG(working_dir=str(directory), llm_model_func=completion,
-                   embedding_func=EmbeddingFunc(embedding_dim=embedding_dim, max_token_size=8192, func=embed),
+    identity = {"llm_model": llm_model, "embedding_backend": embedding_backend,
+                "embedding_model": embedding_model, "embedding_revision": embedding_revision,
+                "embedding_dim": embedding_dim, "embedding_max_length": embedding_max_length,
+                "embedding_query_prefix": embedding_query_prefix,
+                "chunk_tokens": chunk_tokens, "chunk_overlap": chunk_overlap}
+    directory = Path(directory)
+    binding_path = directory / "index_config.json"
+    if binding_path.exists():
+        if read_json(binding_path) != identity:
+            raise ValueError("index model/config changed; use a fresh experiment ROOT and rebuild candidate pools")
+    elif directory.exists() and any(directory.iterdir()):
+        raise ValueError("existing index has no model binding (possibly an old API embedding index); "
+                         "preserve it and use a fresh experiment ROOT to rebuild index and candidate pools")
+    embedding = await make_embedding_func(
+        backend=embedding_backend, model=embedding_model, dim=embedding_dim, revision=embedding_revision,
+        device=embedding_device, batch_size=embedding_batch_size, max_length=embedding_max_length,
+        query_prefix=embedding_query_prefix,
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    write_json(binding_path, identity)  # Bind even partially built indexes before the first insert.
+    rag = LightRAG(working_dir=str(directory), llm_model_func=completion, llm_model_name=llm_model,
+                   embedding_func=embedding, embedding_func_max_async=1 if embedding_backend == "local" else 8,
                    chunk_token_size=chunk_tokens, chunk_overlap_token_size=chunk_overlap)
     await rag.initialize_storages(); await initialize_pipeline_status()
     return rag
@@ -107,15 +124,43 @@ async def ingest_corpus(rag, evidence, manifest_path, config, batch_size=32):
     path = Path(manifest_path)
     if path.exists():
         if read_json(path)["fingerprint"] != binding: raise ValueError("index corpus/config changed")
+        print(f"Reusing complete index: {len(evidence)} documents", flush=True)
         return binding
+    from lightrag.base import DocStatus
+    started = time.perf_counter()
+    newly_processed = skipped = 0
+    print(f"Indexing {len(evidence)} unique documents; completed documents will be reused", flush=True)
     for start in range(0, len(evidence), batch_size):
         batch = evidence[start:start+batch_size]
+        statuses = await rag.doc_status.get_by_ids([e.id for e in batch])
+        pending = [e for e, status in zip(batch, statuses)
+                   if not status or status.get("status") != DocStatus.PROCESSED]
+        skipped += len(batch) - len(pending)
         # Metadata contains stable source IDs, never question/gold/answer fields.
         # LightRAG normalizes file paths, which can strip URLs. Store stable IDs
         # here and restore full source URLs/titles from the fixed registry at retrieval.
-        await rag.ainsert([e.title + "\n" + e.text for e in batch], ids=[e.id for e in batch],
-                          file_paths=[e.id for e in batch])
-        print(f"indexed {min(start+batch_size,len(evidence))}/{len(evidence)} documents", flush=True)
+        if pending:
+            await rag.ainsert([e.title + "\n" + e.text for e in pending], ids=[e.id for e in pending],
+                              file_paths=[e.id for e in pending])
+        statuses = await rag.doc_status.get_by_ids([e.id for e in batch])
+        failed = [e.id for e, status in zip(batch, statuses)
+                  if not status or status.get("status") != DocStatus.PROCESSED]
+        if len(statuses) != len(batch) or failed:
+            raise RuntimeError(f"LightRAG has incomplete documents (example IDs: {failed[:5]}). "
+                               "Index is NOT marked complete; resolve the API error and rerun this cell.")
+        newly_processed += len(pending)
+        done = min(start+batch_size, len(evidence))
+        elapsed = time.perf_counter() - started
+        rate = newly_processed / max(elapsed, 1e-9)
+        eta = (len(evidence)-done) / rate if rate else None
+        progress = {"documents": len(evidence), "completed_prefix": done, "reused": skipped,
+                    "newly_processed": newly_processed, "elapsed_seconds": elapsed,
+                    "new_documents_per_minute": rate*60, "eta_seconds": eta,
+                    "eta_scope": "remaining documents assuming uncached; excludes candidate queries and task preparation"}
+        write_json(path.parent / "ingestion_progress.json", progress)
+        eta_text = f"{eta/3600:.2f} h" if eta is not None else "unknown (cache only)"
+        print(f"indexed {done}/{len(evidence)}; reused={skipped}; "
+              f"new={rate*60:.1f} docs/min; estimated remaining={eta_text}", flush=True)
     write_json(path, {"fingerprint": binding, "documents": len(evidence), "config": config})
     return binding
 

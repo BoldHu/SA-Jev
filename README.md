@@ -7,11 +7,11 @@
 主入口是 `notebooks/`，代码复用 `src/sa_jev/`。每个 notebook 都挂载 Drive、支持 Git 快进同步、初始化相同依赖；模型、候选缓存、原始结果、CSV 与 PNG/PDF 保存到 `MyDrive/SA-Jev/{pilot,full}`。
 
 1. 每个 notebook 第一个代码单元的 `REPO_URL` 默认指向 `https://github.com/BoldHu/SA-Jev.git`，运行时自动克隆并同步代码，可通过环境变量 `SAJEV_REPO_URL` 覆盖。如需使用 ZIP，将 `REPO_URL` 改为 `''`，并将 `artifacts/sa-jev-source.zip` 放到 `MyDrive/SA-Jev/`。
-2. 填写项目根目录 `.env`（没有时从 `.env.example` 复制），上传到 `MyDrive/SA-Jev/.env`。所有 notebook 的第三个代码单元自动读取同一份文件；无需配置 Colab Secrets。Colab 打开 `00_environment_data.ipynb`，保持 `MODE='pilot'`，先检查 tiny 流程，再下载小样本、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。
+2. 填写项目根目录 `.env`（没有时从 `.env.example` 复制），上传到 `MyDrive/SA-Jev/.env`。所有 notebook 的第三个代码单元自动读取同一份文件；无需配置 Colab Secrets。`00_environment_data.ipynb` 默认恢复为 `MODE='pilot'`：先检查 tiny 流程和本地编码器，再下载小规模数据、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。结果保存在 `MyDrive/SA-Jev/pilot`，不下载或训练 OpenJev-4B 主模型。首个代码单元的 `AUTO_DISCONNECT=True` 会在准备成功且 Drive 写入刷新后释放 Colab 运行时。
 3. 运行 `01_original_diagnostics.ipynb`，先看重复调用与 K 扩展。独立无关扰动部分需要完成核验的测试包，不会用生成草稿冒充结果。
-4. 在单卡 A100 上依次运行 `02_stage1.ipynb`、`03_stage2.ipynb`。pilot 默认各两个 optimizer step。检查 loss、梯度、实测显存、checkpoint 重载和 ETA，再决定 full。
+4. 在单卡 A100 上依次运行 `02_stage1.ipynb`、`03_stage2.ipynb`。保持 `MODE='pilot'` 和 `ROOT = DRIVE / MODE`，直接读取 00 准备的 pilot 数据；训练 pilot 默认各两个 optimizer step。检查 loss、梯度、实测显存、checkpoint 重载和 ETA，再决定全量训练。确认实际分配显存，主实验上限是 A100 80GB。
 5. 运行 `04_main_comparison.ipynb`，确认相同池、预算、回答器以及逐题结果可比较。pilot 可以只取少量题。
-6. 将各 notebook 的 MODE 改成 `full`，从 00 重新准备完整数据和独立缓存，再执行 01→02→03→04；随后执行 05（独立稳定性/有效变化）、06（消融）、07（效率）、08（工业案例）。正式主实验默认三个种子。
+6. 模型 pilot 通过后，先将 **00 首个代码单元**的 `MODE` 改为 `'full'`，完整运行一次，另存 `MyDrive/SA-Jev/full`。pilot 数据不能代替这次全量准备。然后将实验 notebook 的 `MODE` 改成 `'full'`，执行 01→02→03→04；随后执行 05（独立稳定性/有效变化）、06（消融）、07（效率）、08（工业案例）。正式主实验默认三个种子。已完成的 full 主实验数据无需重复准备。若此前已完成 full 数据却尚未测试模型，可先保持训练 notebook 的 `MODE='pilot'`，仅把 `ROOT` 改成 `DRIVE / 'full'` 做少步验证，之后再恢复 `ROOT = DRIVE / MODE`。
 
 full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不可用，将官方 `dev.json` 和 `id_aliases.json` 分别放到 `ROOT/raw/2wiki_dev.json` 与 `2wiki_id_aliases.json`。官方 dev 被用作跨数据集测试，不参与训练。数据下载与建图可能耗时，应先估计 pilot 的实际吞吐。
 
@@ -23,16 +23,50 @@ full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不
 
 ```dotenv
 OPENAI_API_KEY=
-OPENAI_BASE_URL=https://ms.snaptokenflow.com/v1
+OPENAI_BASE_URL=https://www.autodl.art/api/v1
 TYPESAFE_API_KEY=
 HF_TOKEN=
 ```
 
-`OPENAI_API_KEY` 填中转站签发的密钥，用于建图、嵌入和最终回答；`TYPESAFE_API_KEY` 用于官方 Jev 基线；`HF_TOKEN` 用于需要认证的 Hugging Face 下载。当前中转站地址为 `https://ms.snaptokenflow.com/v1`，保留 `/v1`，不要追加 `/chat/completions`。更换服务商时修改此地址，并在 `configs/research.yaml` 匹配模型名称和嵌入维度；若改用默认 OpenAI 服务，可将 `OPENAI_BASE_URL` 留空。更新本地文件后也要更新 Drive 中的 `.env`，再运行第三个单元，已有的 Drive 文件不会被模板覆盖。
+`OPENAI_API_KEY` 填服务商签发的密钥，用于建图时的文本抽取和最终回答；默认向量编码器在本地运行，不使用 API 密钥。`TYPESAFE_API_KEY` 用于官方 Jev 基线；`HF_TOKEN` 用于需要认证的 Hugging Face 下载。最终选择的服务地址为 `https://www.autodl.art/api/v1`，保留 `/api/v1`，不要追加 `/chat/completions`。更换聊天服务商时修改此地址，并在 `configs/research.yaml` 匹配聊天模型名称；若改用默认 OpenAI 服务，可将 `OPENAI_BASE_URL` 留空。更新本地文件后也要更新 Drive 中的 `.env`，再运行第三个单元，已有的 Drive 文件不会被模板覆盖。
 
-`configs/research.yaml` 中的建图模型 `retrieval.llm_model` 和最终回答模型 `evaluation.answer_model` 统一使用 `gemini-3.1-flash-lite`；ViDoRe 建图也读取相同配置。证据排序/充分性训练仍使用 `shenjunhao/OpenJev-4B`。向量模型独立使用 `text-embedding-3-small`（1536 维），服务令牌必须有该模型的可用通道；Gemini 聊天模型不能代替 embedding 接口。更改建图模型后，已经生成的索引与候选缓存应保留在旧实验目录，在新的实验目录从 `00` 重新准备，避免混用两种建图配置。
+`configs/research.yaml` 中的建图模型 `retrieval.llm_model` 和最终回答模型 `evaluation.answer_model` 最终统一使用 `DeepSeek-V4.1-Flash`；ViDoRe 建图也读取相同配置。证据排序/充分性训练仍使用 `shenjunhao/OpenJev-4B`。2026-11-07 最后一次聊天检查返回 200、正文 `OK`，耗时 3.687 秒，服务返回模型名 `DeepSeek-Flash`；本地 BGE + 该模型的两文档建图、混合检索和缓存检查也通过。实际请求选项会记入回答缓存；训练随机种子仍按配置执行，不把聊天接口响应视为严格确定性的结果。切换建图模型后应重建索引与固定候选池，不能混用旧模型的缓存。
+
+向量已改为本地运行的 [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5)，固定 revision，384 维、L2 归一化；查询按官方用法加检索前缀，文档不加。`configs/research.yaml` 的 `retrieval.embedding_backend: local` 是默认值，不再请求 `/embeddings`。`embedding_device: auto` 有 GPU 时使用 GPU，否则使用 CPU；batch size 默认 16，显存不足可调小。模型冻结，仅用于一次建库和固定候选池检索，不参与 SA-Jev 训练。
+
+`00_environment_data.ipynb` 在 smoke 后新增“本地向量编码器”检查单元：自动下载、检查向量形状/归一化、打印速度和 GPU 显存，记录到 `ROOT/embedding_check.json`。Colab 权重缓存位于 `MyDrive/SA-Jev/huggingface/hub`，以后复用；已有运行时更新代码和安装单元后需重启，再按顺序初始化。主英文任务可使用该编码器；工业案例若包含非英文 OCR，应单独配置合适的多语言模型并注明检索设置，不把英文编码器结果当作多语言能力。编码器输入上限为 512 个自身 tokenizer 的 token，长输入按模型规则截断，完整候选正文保留，需在检索覆盖率中评估影响。
+
+更改编码器后旧向量索引及候选缓存必须重建，程序会拒绝混用。可在 Drive 中把旧的 `pilot/index`、`pilot/data/pools`、`pilot/data/pools_max` 重命名备份后，从 `00` 的建图单元继续，再运行后面的任务状态准备单元；原始数据无需重新下载。所有方法共享这次重建后的固定候选池，已用旧池得到的评测结果不能混入新对比。
+
+本地验证入口：`python scripts/check_local_embeddings.py` 使用真实编码器和测试 LLM；加 `--live-llm` 则读取 `.env`，用真实聊天 API 对两篇合成文档跑原生 LightRAG 建图、混合检索和缓存检查。每次创建独立测试目录，不修改正式索引。
 
 Colab 固定读取 `/content/drive/MyDrive/SA-Jev/.env`，本地 notebook 和 CLI 读取项目根目录 `.env`。首次运行第三个单元时，若文件不存在会创建空白模板并打印位置。填写或修改后重新运行第三个单元，再继续实验；该文件中的设置会覆盖会话旧值，留空会清除对应旧值。第三个单元只显示 `loaded`/`empty`，不打印密钥；`loaded` 只表示变量已读取，不代表服务权限或额度已验证。实际 `.env` 已被 Git 忽略，源码 ZIP 只包含空白 `.env.example` 模板。
+
+## 00 保存、恢复与自动断开
+
+当前先跑 pilot：在 Colab 的“运行时 → 更改运行时类型”选择 **Python 3、硬件加速器 None（CPU）、标准 RAM**。00 不加载 4B 主模型；本地 BGE 支持 CPU，图谱文本抽取在 API 服务端执行。T4 可加速本地向量编码，但不能直接加速服务端抽取，不必为 00 占用 A100。全量语料及图谱会使用更多系统内存，有条件时选高 RAM；00 尚未完成全量实测，不能保证标准 RAM 足够。模型训练 pilot 在 02/03 中再切换 A100，并核对实际显存。
+
+睡前先完成 Drive 授权、依赖安装/必要重启、tiny smoke、本地向量检查，再顺序执行其余单元。准备期间不要改变聊天模型、编码器、语料范围或分块配置。API 服务余额/限额和 Drive 可用空间需要能覆盖本次运行。2Wiki 官方归档已做小范围下载检查（HTTP 200、ZIP 头正确，约 259 MB）；完整全量数据和 Colab 长时间运行尚未在本机验证。
+
+| Drive 位置（均在 `MyDrive/SA-Jev` 下） | 内容 |
+|---|---|
+| `<MODE>/raw/` | 下载的原始数据与来源记录；2Wiki 仅 full 模式下载 |
+| `<MODE>/data/` | 去重语料、问题划分、固定候选池、任务状态、轨迹偏好、重叠审计、扰动核验草稿 |
+| `<MODE>/index/` | 图谱、向量库、抽取响应缓存、文档处理状态与 `ingestion_progress.json` |
+| `huggingface/` | 本地编码器与 Hugging Face 下载缓存 |
+| `<MODE>/00_complete.json` | 00 全部准备步骤成功后才生成的完成标记；包含本次运行 ID、完成时间和状态数量 |
+
+`<MODE>` 当前为 `pilot`，全量时为 `full`。成功结束后，最后一个代码单元先调用 `drive.flush_and_unmount()`，再调用 `runtime.unassign()`；旧运行的完成标记不会触发本次自动断开。Drive 刷新失败时不会主动释放运行时。需要保留会话查看结果时，将首个代码单元的 `AUTO_DISCONNECT = False`。这只是完成后的主动释放，不能阻止 Colab 提前回收会话。下一次连接仍需挂载、安装依赖及加载 `.env`；Drive 数据保留。
+
+建图按已处理文档恢复；完成索引及已写入的问题候选池可以复用。失败文档不会再被当作“全部建库完成”。原始 JSON/JSONL 和准备产物先写临时文件，成功后替换目标，2Wiki 下载/解压亦如此。硬中断可能留下 `.tmp`/`.part` 文件或使正在执行的批次重做，不能承诺零重复或外部 Drive 永不损坏。重新连接时先运行每个 notebook 开头的挂载/安装/环境读取单元，再从失败阶段继续；中断的状态构造或重叠扫描目前会重跑该阶段。
+
+以前用旧代码中断留下的数据不保证完整；以前更换过 Gemini/DeepSeek、编码器或分块设置的索引不能直接混用。若启动时提示旧索引配置不匹配，备份旧 `pilot` 目录后使用新目录重新准备，不必删除备份。当前代码的恢复保护不能修复旧版本已写坏的文件；原始文件解析失败时需要重新下载该文件。
+
+最后应看到 `00 COMPLETE`，并检查 Drive 的 `pilot/00_complete.json`（全量则是 `full/00_complete.json`）为本次运行时间。仅有 `raw/`、索引目录或进度输出不表示全部结束。数据与检索设置保持一致时，后续主实验直接读取这些文件，无需再次跑 00。**00 不完成所有后续实验的数据工作**：05 仍需人工核验独立扰动及有效变化草稿；06 会从已有数据生成小 K 消融状态/轨迹；08 独立下载 ViDoRe OCR/页面数据并构建工业案例索引与候选池，产物保存在当前 `ROOT/industrial`。Stage 2 的等义视图在线生成，冻结参考模型的轨迹概率缓存也在训练阶段产生，无需重建主图谱。
+
+pilot 每个源文件取 64 条，四个源文件合计最多 256 条原始记录，每题又有多个段落；实际问题/去重段落数会打印在 `data_manifest` 的 `questions`/`corpus_documents`。即使 pilot 也会完整扫描 OpenJevData，所以不要按“两文档联调 33 秒”推算整个流程几分钟结束。首次 00 pilot 建议预留数小时，并以首批 32 个文档之后的 `estimated remaining` 和后续候选查询 ETA 为准；建图 ETA 不含下载、候选查询和重叠审计。尚未实测完整 00 pilot 或 A100 4B pilot，无法承诺固定时长。02/03 pilot 各两步，但首次仍有 4B 下载、加载、验证和 DPO 参考计算开销；全量训练和消融也可能很耗时。
+
+全量数据准备可能很久，不能保证一夜完成；[Colab 官方说明](https://research.google.com/colaboratory/faq.html)明确运行时有最大寿命和动态资源限制，Drive 中已落盘的文件不等于运行时会一直持续。
 
 ## 本地 Conda
 

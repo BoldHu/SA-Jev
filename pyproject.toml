@@ -11,7 +11,7 @@ dependencies = ["numpy>=1.26", "torch>=2.6", "matplotlib>=3.8", "pyyaml>=6", "tq
 
 [project.optional-dependencies]
 train = ["transformers==5.12.1", "peft==0.19.1", "safetensors>=0.5", "huggingface-hub>=0.30", "datasets==5.1.0", "accelerate>=1.2"]
-retrieval = ["lightrag-hku==1.5.7", "sentence-transformers>=3", "rank-bm25==0.2.2", "openai>=1.50"]
+retrieval = ["lightrag-hku==1.5.7", "sentence-transformers==6.2.0", "rank-bm25==0.2.2", "openai>=1.50"]
 test = ["pytest>=8", "nbformat>=5", "nbclient>=0.10", "ipykernel>=6"]
 
 [project.scripts]
