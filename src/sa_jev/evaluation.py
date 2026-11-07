@@ -23,7 +23,7 @@ class OfficialJev:
         import requests as http
         self.session = http.Session(); self.model = model; self.endpoint = endpoint; self.timeout = timeout
         key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
-        if not key: raise ValueError("Set TYPESAFE_API_KEY or JEV_API_KEY; never place credentials in notebooks/results")
+        if not key: raise ValueError("Fill TYPESAFE_API_KEY in MyDrive/SA-Jev/.env (Colab) or the project .env file, then reload it")
         self.session.headers["Authorization"] = "Bearer " + key
         self.actual_models = set()
         self.output_tokens = 0

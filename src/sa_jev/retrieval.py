@@ -71,12 +71,17 @@ async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fin
 async def make_lightrag(directory, *, llm_model="gpt-4o-mini", embedding_model="text-embedding-3-small",
                         embedding_dim=1536, chunk_tokens=512, chunk_overlap=64):
     """Use native ingestion and mixed retrieval; callers supply credentials via env."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY is missing. Fill it in MyDrive/SA-Jev/.env (Colab) or the project "
+            ".env file (local), then rerun the third notebook code cell before cache_pools. "
+            "Use the extraction/embedding provider's key; a Jev or Hugging Face token is not a substitute."
+        )
     from lightrag import LightRAG
     from lightrag.llm.openai import openai_complete_if_cache, openai_embed
     from lightrag.utils import EmbeddingFunc
     from lightrag.kg.shared_storage import initialize_pipeline_status
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key: raise ValueError("Set OPENAI_API_KEY for the selected LightRAG extraction/embedding service")
     base_url = os.environ.get("OPENAI_BASE_URL")
 
     async def completion(prompt, system_prompt=None, history_messages=None, **kwargs):

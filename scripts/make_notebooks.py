@@ -64,23 +64,22 @@ def cli(command, *args):
     subprocess.run([sys.executable, '-m', 'sa_jev.cli', command, '--root', str(ROOT), *map(str,args)], check=True)
 '''
 
-SECRETS = '''# Credentials are read from Colab Secrets or environment; never printed or saved.
-if 'google.colab' in sys.modules:
-    from google.colab import userdata
-    for key in ('HF_TOKEN', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'TYPESAFE_API_KEY'):
-        if not os.environ.get(key):
-            try:
-                value = userdata.get(key)
-                if value: os.environ[key] = value
-            except Exception:
-                pass
+ENVIRONMENT = '''# Read the same credential file in every notebook. Fill it in once.
+from sa_jev.environment import load_environment
+ENV_FILE = (DRIVE if 'google.colab' in sys.modules else PROJECT) / '.env'
+credential_status = load_environment(ENV_FILE, template=PROJECT / '.env.example')
+print('Credential file:', ENV_FILE)
+for name in ('OPENAI_API_KEY', 'OPENAI_BASE_URL', 'TYPESAFE_API_KEY', 'HF_TOKEN'):
+    print(name + ':', 'loaded' if credential_status[name] else 'empty')
+if not credential_status['OPENAI_API_KEY']:
+    print('Fill OPENAI_API_KEY in the file above, save it, then rerun this cell before building the index or answering questions.')
 '''
 
 
 def create(name, title, content):
     notebook = nbf.v4.new_notebook()
     notebook.cells = [nbf.v4.new_markdown_cell(title), nbf.v4.new_code_cell(BOOT),
-                      nbf.v4.new_code_cell(INSTALL), nbf.v4.new_code_cell(SECRETS)]
+                      nbf.v4.new_code_cell(INSTALL), nbf.v4.new_code_cell(ENVIRONMENT)]
     for kind, text in content:
         notebook.cells.append(nbf.v4.new_markdown_cell(text) if kind == 'md' else nbf.v4.new_code_cell(text))
     notebook.metadata = {"kernelspec": {"display_name":"Python 3", "language":"python", "name":"python3"},

@@ -7,7 +7,7 @@
 主入口是 `notebooks/`，代码复用 `src/sa_jev/`。每个 notebook 都挂载 Drive、支持 Git 快进同步、初始化相同依赖；模型、候选缓存、原始结果、CSV 与 PNG/PDF 保存到 `MyDrive/SA-Jev/{pilot,full}`。
 
 1. 每个 notebook 第一个代码单元的 `REPO_URL` 默认指向 `https://github.com/BoldHu/SA-Jev.git`，运行时自动克隆并同步代码，可通过环境变量 `SAJEV_REPO_URL` 覆盖。如需使用 ZIP，将 `REPO_URL` 改为 `''`，并将 `artifacts/sa-jev-source.zip` 放到 `MyDrive/SA-Jev/`。
-2. Colab 打开 `00_environment_data.ipynb`。保持 `MODE='pilot'`，先检查 tiny 流程，再下载小样本、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。配置 Colab Secrets：抽取/嵌入/回答服务使用 `OPENAI_API_KEY`，可选 `OPENAI_BASE_URL`；官方 Jev 使用 `TYPESAFE_API_KEY`；可选 `HF_TOKEN`。密钥不会进入结果文件。
+2. 填写项目根目录 `.env`（没有时从 `.env.example` 复制），上传到 `MyDrive/SA-Jev/.env`。所有 notebook 的第三个代码单元自动读取同一份文件；无需配置 Colab Secrets。Colab 打开 `00_environment_data.ipynb`，保持 `MODE='pilot'`，先检查 tiny 流程，再下载小样本、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。
 3. 运行 `01_original_diagnostics.ipynb`，先看重复调用与 K 扩展。独立无关扰动部分需要完成核验的测试包，不会用生成草稿冒充结果。
 4. 在单卡 A100 上依次运行 `02_stage1.ipynb`、`03_stage2.ipynb`。pilot 默认各两个 optimizer step。检查 loss、梯度、实测显存、checkpoint 重载和 ETA，再决定 full。
 5. 运行 `04_main_comparison.ipynb`，确认相同池、预算、回答器以及逐题结果可比较。pilot 可以只取少量题。
@@ -16,6 +16,19 @@
 full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不可用，将官方 `dev.json` 和 `id_aliases.json` 分别放到 `ROOT/raw/2wiki_dev.json` 与 `2wiki_id_aliases.json`。官方 dev 被用作跨数据集测试，不参与训练。数据下载与建图可能耗时，应先估计 pilot 的实际吞吐。
 
 旧版 notebook 若在安装后报 `ModuleNotFoundError: No module named 'sa_jev'`，是当前内核可能尚未读取 editable 安装生成的 `.pth` 路径。新版第二个代码单元会在安装后调用 `site.addsitedir()` 刷新路径，并打印 `SA-Jev source:` 以核对实际加载位置。更新 notebook 后重新运行安装单元即可；若 pip 提示已经加载的依赖需要重启，则重启会话后按顺序重跑开头的初始化单元。
+
+所有密钥集中在一个文件中，填写等号右侧，不用的项目留空：
+
+```dotenv
+OPENAI_API_KEY=
+OPENAI_BASE_URL=
+TYPESAFE_API_KEY=
+HF_TOKEN=
+```
+
+`OPENAI_API_KEY` 用于建图、嵌入和最终回答；`TYPESAFE_API_KEY` 用于官方 Jev 基线；`HF_TOKEN` 用于需要认证的 Hugging Face 下载。默认 OpenAI 服务的 `OPENAI_BASE_URL` 留空即可；兼容服务商填写自己的基础地址，并在 `configs/research.yaml` 匹配模型名称和嵌入维度。
+
+Colab 固定读取 `/content/drive/MyDrive/SA-Jev/.env`，本地 notebook 和 CLI 读取项目根目录 `.env`。首次运行第三个单元时，若文件不存在会创建空白模板并打印位置。填写或修改后重新运行第三个单元，再继续实验；该文件中的设置会覆盖会话旧值，留空会清除对应旧值。第三个单元只显示 `loaded`/`empty`，不打印密钥；`loaded` 只表示变量已读取，不代表服务权限或额度已验证。实际 `.env` 已被 Git 忽略，源码 ZIP 只包含空白 `.env.example` 模板。
 
 ## 本地 Conda
 

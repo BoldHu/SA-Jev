@@ -7,7 +7,7 @@ name = "sa-jev"
 version = "0.1.0"
 description = "State-aware evidence decisions on fixed GraphRAG retrieval pools"
 requires-python = ">=3.11"
-dependencies = ["numpy>=1.26", "torch>=2.6", "matplotlib>=3.8", "pyyaml>=6", "tqdm>=4.66", "requests>=2.32"]
+dependencies = ["numpy>=1.26", "torch>=2.6", "matplotlib>=3.8", "pyyaml>=6", "tqdm>=4.66", "requests>=2.32", "python-dotenv>=1.0"]
 
 [project.optional-dependencies]
 train = ["transformers==5.12.1", "peft==0.19.1", "safetensors>=0.5", "huggingface-hub>=0.30", "datasets==5.1.0", "accelerate>=1.2"]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 from pathlib import Path
 from .io import read_json, read_jsonl, write_json
 
@@ -23,6 +24,10 @@ def main():
     parser.add_argument("--no-qa", action="store_true")
     parser.add_argument("--small-k", action="store_true")
     args = parser.parse_args()
+    env_file = Path(os.environ.get("SAJEV_ENV_FILE") or Path(__file__).resolve().parents[2] / ".env")
+    if os.environ.get("SAJEV_ENV_FILE") or env_file.is_file():
+        from .environment import load_environment
+        load_environment(env_file)
     root = Path(args.root)
     if args.command == "smoke":
         from .smoke import run
