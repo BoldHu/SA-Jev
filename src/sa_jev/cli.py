@@ -30,8 +30,8 @@ def main():
         load_environment(env_file)
     root = Path(args.root)
     if args.command == "smoke":
-        from .smoke import run
-        print(run(root, args.device, args.raw)); return
+        from .smoke import run_fresh
+        print(run_fresh(root, args.device, args.raw)); return
     from .experiments import load_config, cache_pools, train_variant, main_experiment, diagnostics_experiment, efficiency_experiment, robustness_experiment, read_questions
     config = load_config(args.config)
     from .preparation import download_sources, normalize_sources, prepare_tasks

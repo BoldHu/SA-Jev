@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from pathlib import Path
+from tempfile import mkdtemp
 import torch
 from .schema import Evidence, Question, Pool, State
 from .data import task_states, audit_splits
@@ -26,6 +27,15 @@ def fixture_questions():
                          ("u0", "u1"), coverage, {f"u{j}": evidence[j].text for j in range(2)},
                          tuple(e.id for e in evidence[2:])))
     return questions
+
+
+def run_fresh(root="outputs", device="cpu", raw=None):
+    """Repeatable notebook/CLI entrypoint; preserve all earlier smoke artifacts."""
+    parent = Path(root) / "smoke"
+    parent.mkdir(parents=True, exist_ok=True)
+    output = Path(mkdtemp(prefix="run_", dir=parent))
+    print(f"Smoke output: {output}", flush=True)
+    return run(output, device, raw)
 
 
 def run(output="outputs/smoke", device="cpu", raw=None):
@@ -69,7 +79,8 @@ def run(output="outputs/smoke", device="cpu", raw=None):
     export_report(rows, output/"evaluation")
     diagnostics = repeat_diagnostics(reloaded, [val[0].state], repeats=2)
     export_report(diagnostics, output/"diagnostics", ("js", "top1_flip", "suf_flip", "seconds"), ("question_id",))
-    summary = {"test_only": True, "model": "tiny causal encoder + actual upstream OpenJev DecisionHead/OptionSetInteractor",
+    summary = {"test_only": True, "output_directory": str(output.resolve()),
+               "model": "tiny causal encoder + actual upstream OpenJev DecisionHead/OptionSetInteractor",
                "data": "small real source records" if raw else "synthetic fixtures", "device": device,
                "train_states": len(train), "validation_states": len(val), "preference_pairs": len(pairs),
                "stage1_optimizer_steps": len(history), "stage2_optimizer_steps": len(history2),

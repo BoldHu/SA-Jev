@@ -67,7 +67,7 @@ def run(root, device, raw):
     assert 'OPENAI_BASE_URL' not in os.environ
     return 'CLI credential loading passed'
 smoke = types.ModuleType('sa_jev.smoke')
-smoke.run = run
+smoke.run_fresh = run
 sys.modules['sa_jev.smoke'] = smoke
 sys.argv = ['sajev', 'smoke']
 main()

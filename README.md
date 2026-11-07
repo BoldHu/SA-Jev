@@ -17,6 +17,8 @@ full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不
 
 旧版 notebook 若在安装后报 `ModuleNotFoundError: No module named 'sa_jev'`，是当前内核可能尚未读取 editable 安装生成的 `.pth` 路径。新版第二个代码单元会在安装后调用 `site.addsitedir()` 刷新路径，并打印 `SA-Jev source:` 以核对实际加载位置。更新 notebook 后重新运行安装单元即可；若 pip 提示已经加载的依赖需要重启，则重启会话后按顺序重跑开头的初始化单元。
 
+`00` 的 smoke 现在直接在 notebook 中执行，失败时显示原始 Python 异常。每次执行都在 `ROOT/smoke/run_*` 创建独立目录，可重复运行并保留旧结果；本地 `sajev smoke` 采用相同方式。其他 notebook CLI 命令会实时显示子进程输出，并在失败异常中附上最后 40 行，避免只看到没有内部原因的 `CalledProcessError`。smoke 通过后再继续数据准备；它使用 tiny 测试模型，不能代替 OpenJev-4B 的显存与性能验证。
+
 所有密钥集中在一个文件中，填写等号右侧，不用的项目留空：
 
 ```dotenv

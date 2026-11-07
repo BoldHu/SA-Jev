@@ -61,7 +61,22 @@ from sa_jev.experiments import load_config, environment_manifest
 config = load_config()
 environment_manifest(ROOT / 'environment.json', config)
 def cli(command, *args):
-    subprocess.run([sys.executable, '-m', 'sa_jev.cli', command, '--root', str(ROOT), *map(str,args)], check=True)
+    from collections import deque
+    tail = deque(maxlen=40)
+    cmd = [sys.executable, '-u', '-m', 'sa_jev.cli', command, '--root', str(ROOT), *map(str,args)]
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
+        try:
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                tail.append(line)
+            returncode = process.wait()
+        except KeyboardInterrupt:
+            process.terminate()
+            process.wait()
+            raise
+    if returncode:
+        raise RuntimeError(f'sajev {command} failed (exit {returncode}). Last output: ' + ''.join(tail))
 '''
 
 ENVIRONMENT = '''# Read the same credential file in every notebook. Fill it in once.
@@ -89,7 +104,7 @@ def create(name, title, content):
 
 
 create('00_environment_data.ipynb', '# SA-Jev · 环境与数据准备\n先跑 pilot。正式训练数据约 8,000 HotpotQA + 4,000 MuSiQue；每题最多 3 个状态。所有模型输入排除答案、分解和 gold 标签。', [
-('code', "cli('smoke', '--device', 'cuda' if __import__('torch').cuda.is_available() else 'cpu')"),
+('code', "import torch\nfrom sa_jev.smoke import run_fresh\n# Execute in the notebook so any failure shows its original traceback.\nsmoke_result = run_fresh(ROOT, device='cuda' if torch.cuda.is_available() else 'cpu')\nsmoke_result"),
 ('md', '下载原始数据：pilot 每个文件 64 条；full 读取完整源。2Wiki 的官方 dev.json 另置于 ROOT/raw/2wiki_dev.json。MuSiQue 两种官方格式均受支持。'),
 ('code', "from sa_jev.preparation import download_sources, download_2wiki, normalize_sources\ndownload_sources(ROOT/'raw', limit=64 if MODE=='pilot' else None)\nif MODE=='full':\n    download_2wiki(ROOT/'raw')\nquestions, manifest = normalize_sources(ROOT/'raw', ROOT/'data')\nmanifest"),
 ('md', '固定 LightRAG 混合召回。原始段落统一入库，不索引答案或标签。此步骤会调用所配置的抽取与嵌入服务；先检查 configs/research.yaml。首次建图通常比训练 pilot 更耗时。'),
