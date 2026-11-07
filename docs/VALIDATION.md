@@ -9,6 +9,7 @@
 | Conda 环境 | 新建 `SA-Jev`；Python 3.11.18、PyTorch 2.6.0+cu118；RTX 3050 Laptop 4GB 可用 | `docs/validation_environment.json` |
 | 测试套件 | 本次 **23 passed，1 failed**（约 81.89s）；唯一失败是本地 `00` notebook 保留用户运行输出，不满足源码 notebook 应无输出的检查；未删除用户日志。smoke 重入、子进程错误显示与环境文件检查均通过 | `python -m pytest -q` |
 | smoke 重复运行 | RTX 3050 上连续两次完整 tiny smoke：每次 Stage 1/2 各 2 步、检查点重载通过、评测错误 0；各自独立目录，第一次检查点字节保持不变 | `outputs/notebook_smoke_reentry/verification.json` |
+| 中转站模型检查 | 使用用户配置的服务令牌查询模型列表返回 200，包含 `gemini-3.1-flash-lite`，不包含 `text-embedding-3-small`；Gemini 小请求返回 401；embedding 小请求返回 503（当前分组无可用通道）。仅确认模型名称与当前失败状态，未宣称接口调用成功 | `outputs/relay_model_check/verification.json` |
 | 真实小数据完整路径 | 下载 HotpotQA train/dev、作者 MuSiQue answerable train/dev 各 8 条；选其中小部分作流程测试，12 个训练状态、6 个验证状态、6 对轨迹；Stage 1 与 Stage 2 各实际更新 2 步；2 题动态评测无运行错误 | `outputs/real_smoke_final/verification.json` |
 | 检查点重载 | tiny 编码器 + **实际上游** DecisionHead/OptionSetInteractor 的保存、重载预测一致 | 同上及 `stage1/step_000002/` |
 | 随机小 Qwen3.5 | 103,936 参数，包含 linear/full attention；CPU 和 CUDA 均完成原生 adapter + PEFT LoRA + 原生 interactor/head 的反传及 optimizer 更新 | `outputs/qwen_lora_check.json`、`outputs/qwen_lora_cuda.json` |
@@ -41,7 +42,7 @@
 
 1. **OpenJev-4B 发布权重 + FLA 0.5.2 + A100**：代表性长状态/长轨迹的前向、反向、显存与吞吐；确认单卡峰值满足约束后才正式训练。
 2. 完整 8k/4k 数据准备、全部 OpenJevData 扫描、实际 K/有效监督覆盖核查；必要时对未知候选补可核验注释。真实 LightRAG 的抽取/嵌入服务尚未调用。
-3. 官方 Jev API、真实回答模型的接入与测量；本次没有读取或使用项目中的 API key 文件。
+3. 官方 Jev API、真实回答模型的接入与测量；中转站 Gemini/embedding 的最小请求已测试但未通过，需先解决通道鉴权和嵌入模型权限。未读取或使用 `JEV_API_KEY.txt`，也未调用官方 Jev API。
 4. 原模型上下文干扰与 K 诊断、三个种子的两阶段训练、共享缓存主对比及 2Wiki 跨数据集评测。
 5. 人工核验约 600 个独立状态的 3 个无关扰动与 1 个有效变化；本次没有生成或声称已有 600 份核验结果。
 6. DPO/稳定性/完整模型/无状态更新/小 K/权重消融；K=16…256 的实测质量、延迟、token、显存及失败比例。

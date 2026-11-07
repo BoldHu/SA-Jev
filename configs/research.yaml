@@ -12,7 +12,7 @@ model:
 retrieval:
   mode: mix
   max_k: 256
-  llm_model: gpt-4o-mini
+  llm_model: gemini-3.1-flash-lite
   embedding_model: text-embedding-3-small
   embedding_dim: 1536
   chunk_tokens: 512
@@ -41,7 +41,7 @@ training:
 evaluation:
   efficiency_max_decision_tokens: 262144
   threshold: 0.5
-  answer_model: gpt-4o-mini
+  answer_model: gemini-3.1-flash-lite
   jev_model: jev-1.13.0
   repeats: 3
   k_values: [16, 32, 64, 128, 256]

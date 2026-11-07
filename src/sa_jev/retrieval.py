@@ -68,7 +68,7 @@ async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fin
     return pool
 
 
-async def make_lightrag(directory, *, llm_model="gpt-4o-mini", embedding_model="text-embedding-3-small",
+async def make_lightrag(directory, *, llm_model="gemini-3.1-flash-lite", embedding_model="text-embedding-3-small",
                         embedding_dim=1536, chunk_tokens=512, chunk_overlap=64):
     """Use native ingestion and mixed retrieval; callers supply credentials via env."""
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()

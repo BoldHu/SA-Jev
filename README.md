@@ -23,12 +23,14 @@ full 模式会下载官方 2Wiki April-2021 修订数据；若其托管链接不
 
 ```dotenv
 OPENAI_API_KEY=
-OPENAI_BASE_URL=
+OPENAI_BASE_URL=https://ms.snaptokenflow.com/v1
 TYPESAFE_API_KEY=
 HF_TOKEN=
 ```
 
-`OPENAI_API_KEY` 用于建图、嵌入和最终回答；`TYPESAFE_API_KEY` 用于官方 Jev 基线；`HF_TOKEN` 用于需要认证的 Hugging Face 下载。默认 OpenAI 服务的 `OPENAI_BASE_URL` 留空即可；兼容服务商填写自己的基础地址，并在 `configs/research.yaml` 匹配模型名称和嵌入维度。
+`OPENAI_API_KEY` 填中转站签发的密钥，用于建图、嵌入和最终回答；`TYPESAFE_API_KEY` 用于官方 Jev 基线；`HF_TOKEN` 用于需要认证的 Hugging Face 下载。当前中转站地址为 `https://ms.snaptokenflow.com/v1`，保留 `/v1`，不要追加 `/chat/completions`。更换服务商时修改此地址，并在 `configs/research.yaml` 匹配模型名称和嵌入维度；若改用默认 OpenAI 服务，可将 `OPENAI_BASE_URL` 留空。更新本地文件后也要更新 Drive 中的 `.env`，再运行第三个单元，已有的 Drive 文件不会被模板覆盖。
+
+`configs/research.yaml` 中的建图模型 `retrieval.llm_model` 和最终回答模型 `evaluation.answer_model` 统一使用 `gemini-3.1-flash-lite`；ViDoRe 建图也读取相同配置。证据排序/充分性训练仍使用 `shenjunhao/OpenJev-4B`。向量模型独立使用 `text-embedding-3-small`（1536 维），服务令牌必须有该模型的可用通道；Gemini 聊天模型不能代替 embedding 接口。更改建图模型后，已经生成的索引与候选缓存应保留在旧实验目录，在新的实验目录从 `00` 重新准备，避免混用两种建图配置。
 
 Colab 固定读取 `/content/drive/MyDrive/SA-Jev/.env`，本地 notebook 和 CLI 读取项目根目录 `.env`。首次运行第三个单元时，若文件不存在会创建空白模板并打印位置。填写或修改后重新运行第三个单元，再继续实验；该文件中的设置会覆盖会话旧值，留空会清除对应旧值。第三个单元只显示 `loaded`/`empty`，不打印密钥；`loaded` 只表示变量已读取，不代表服务权限或额度已验证。实际 `.env` 已被 Git 忽略，源码 ZIP 只包含空白 `.env.example` 模板。
 
