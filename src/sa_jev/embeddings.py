@@ -18,38 +18,47 @@ BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 # Official Hub LFS metadata for model.safetensors at BGE_REVISION.
 BGE_WEIGHT_BYTES = 133466304
 BGE_WEIGHT_SHA256 = "3c9f31665447c8911517620762200d2245a2518d6e7208acc78cd9db317e21ad"
+MINILM_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+MINILM_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+MINILM_WEIGHT_BYTES = 90868376
+MINILM_WEIGHT_SHA256 = "53aa51172d142c89d9012cce15ae4d6cc0ca6895895114379cacb4fab128d9db"
 
 
-def ensure_bge_weights(cache_folder=None):
+def ensure_embedding_weights(model, revision, cache_folder=None):
     """Validate the pinned small encoder; repair only its corrupt cached weight once."""
     from huggingface_hub import hf_hub_download, constants
 
+    specs = {(BGE_MODEL, BGE_REVISION): (BGE_WEIGHT_BYTES, BGE_WEIGHT_SHA256),
+             (MINILM_MODEL, MINILM_REVISION): (MINILM_WEIGHT_BYTES, MINILM_WEIGHT_SHA256)}
+    if (model, revision) not in specs:
+        raise ValueError("No pinned weight checksum for this embedding model/revision")
+    weight_bytes, weight_sha256 = specs[model, revision]
     cache = Path(cache_folder or os.environ.get("HF_HUB_CACHE") or
                  (str(Path(os.environ["HF_HOME"]) / "hub") if os.environ.get("HF_HOME")
                   else constants.HF_HUB_CACHE)).expanduser().absolute()
-    snapshot = cache / ("models--" + BGE_MODEL.replace("/", "--")) / "snapshots" / BGE_REVISION
+    snapshot = cache / ("models--" + model.replace("/", "--")) / "snapshots" / revision
     expected_path = snapshot / "model.safetensors"
 
     def validate(path):
         size = path.stat().st_size
-        if size != BGE_WEIGHT_BYTES:
-            raise ValueError(f"expected {BGE_WEIGHT_BYTES:,} bytes, got {size:,}")
+        if size != weight_bytes:
+            raise ValueError(f"expected {weight_bytes:,} bytes, got {size:,}")
         with path.open("rb") as stream:
             actual_hash = hashlib.file_digest(stream, "sha256").hexdigest()
-        if actual_hash != BGE_WEIGHT_SHA256:
+        if actual_hash != weight_sha256:
             raise ValueError("SHA-256 differs from the official pinned weight")
 
     def download(force=False):
-        return Path(hf_hub_download(BGE_MODEL, "model.safetensors", revision=BGE_REVISION,
+        return Path(hf_hub_download(model, "model.safetensors", revision=revision,
                                    cache_dir=str(cache), force_download=force))
 
-    print(f"Checking pinned BGE weight: {expected_path}", flush=True)
+    print(f"Checking pinned {model} weight: {expected_path}", flush=True)
     # Inspect even a dangling snapshot link instead of treating it as a new download.
     path = expected_path if expected_path.exists() or expected_path.is_symlink() else download()
     try:
         validate(path)
     except (OSError, ValueError) as error:
-        print(f"BGE weight cache is invalid: {error}. Re-downloading the same revision once.", flush=True)
+        print(f"Embedding weight cache is invalid: {error}. Re-downloading the same revision once.", flush=True)
         # HF force_download replaces the blob, but may leave an existing regular
         # snapshot file untouched (e.g. Drive/non-symlink caches). Preserve that
         # single entry under another name before asking HF to rebuild the pointer.
@@ -63,11 +72,16 @@ def ensure_bge_weights(cache_folder=None):
         try:
             validate(path)
         except (OSError, ValueError) as retry_error:
-            raise RuntimeError("Downloaded BGE weight still fails integrity validation. "
+            raise RuntimeError("Downloaded embedding weight still fails integrity validation. "
                                "Use a fresh HF_HUB_CACHE and check the download/Drive connection; "
                                "do not delete raw data or graph indexes.") from retry_error
-    print(f"BGE weight verified: {BGE_WEIGHT_BYTES:,} bytes, SHA-256 matches.", flush=True)
+    print(f"{model} weight verified: {weight_bytes:,} bytes, SHA-256 matches.", flush=True)
     return path
+
+
+def ensure_bge_weights(cache_folder=None):
+    """Backward-compatible entry point for the legacy BGE protocol."""
+    return ensure_embedding_weights(BGE_MODEL, BGE_REVISION, cache_folder)
 
 
 async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
@@ -105,6 +119,8 @@ async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
     started = time.perf_counter()
     if model == BGE_MODEL and revision == BGE_REVISION:
         await asyncio.to_thread(ensure_bge_weights, cache)
+    elif model == MINILM_MODEL and revision == MINILM_REVISION:
+        await asyncio.to_thread(ensure_embedding_weights, model, revision, cache)
     encoder = await asyncio.to_thread(
         SentenceTransformer, model, revision=revision, device=actual_device,
         cache_folder=cache, trust_remote_code=False, model_kwargs={"use_safetensors": True},
