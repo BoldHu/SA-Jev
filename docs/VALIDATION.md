@@ -6,6 +6,7 @@
 
 | 检查 | 实际结果 | 可追溯输出 |
 |---|---|---|
+| Colab ZIP 路径兼容修复 | **8 passed**（13.93s）。真实发布包使用反斜杠路径，Windows 的 ZipInfo 自动转换掩盖了原导入器在 Linux 的匹配错误；现在仅在成员匹配时统一分隔符。以保留原始反斜杠的 ZipInfo 模拟 Linux 行为，从真实固定 SHA-256 压缩包全新导入三套图并通过完整性检查，文档数为 4,927 / 7,674 / 3,258，二次运行复用成功。无下载、无模型 API 调用；未在真实 Colab 执行 | `pytest -q tests/test_public_indexes.py`；`outputs/public_index_inspection/colab_zip_uzi99i5u/verification.json` |
 | 公开索引适配完整回归 | **57 passed**（154.77s）。包含重复 ZIP 路径分离、2Wiki 完整副本选择、来源追踪、编码器不匹配拒绝、完整 500×3 测试题划分和问题族隔离、9 个 notebook 格式与语法，以及原两阶段训练契约。旧测试要求 notebook 无输出的约束改为允许保留用户真实日志；CLI 测试加入新的配置路径 | Conda SA-Jev：`torch.set_num_threads(2); pytest.main(['-q'])` |
 | 公开候选缓存复用最终检查 | 后续新增完整缓存快速复用后，相关 **12 passed**（5.80s）。清单、问题、配置、图绑定和所有池文件齐备时不再加载编码器/图、不再调用 API；原准备失败/完成条件检查仍通过 | `pytest -q tests/test_public_indexes.py tests/test_preparation_resume.py` |
 | 公开 LightRAG 索引真实导入 | 下载并验证固定 ZIP SHA-256，按重复 ZipInfo 分开导入三套图；2Wiki 使用包内完整冲突副本。实际文档数 HotpotQA 4,927、MuSiQue 7,674、2Wiki 3,258。真实 MiniLM 与每图三个分块的已存向量余弦匹配（接近 1）。查询前后图、向量、原文、分块文件哈希不变 | `outputs/public_index_inspection/public_oqp5aaw8/index/public_manifest.json`、`unchanged_public_artifacts.json` |

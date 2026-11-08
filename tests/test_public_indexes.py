@@ -4,7 +4,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import warnings
-from zipfile import ZipFile
+from zipfile import ZipFile, ZipInfo
 
 import networkx as nx
 import numpy as np
@@ -16,10 +16,16 @@ from sa_jev.retrieval import PoolCache, retrieve_once
 from sa_jev.schema import Evidence
 
 
-def test_duplicate_zip_paths_and_explicit_2wiki_repairs(tmp_path, monkeypatch):
+@pytest.mark.parametrize("separator", ["/", "\\"])
+def test_duplicate_zip_paths_and_explicit_2wiki_repairs(tmp_path, monkeypatch, separator):
     path = tmp_path/"release.zip"
     with warnings.catch_warnings(), ZipFile(path, "w") as z:
         warnings.simplefilter("ignore", UserWarning)
+        def write_member(name, content):
+            member = ZipInfo("large_scale_lightrag/"+name)
+            # Set after construction to avoid Windows' automatic separator conversion.
+            member.filename = member.orig_filename = member.filename.replace("/", separator)
+            z.writestr(member, content)
         for ds in public.DATASETS:
             cid, did = f"chunk-{ds}", f"doc-{ds}"
             graph = nx.Graph(); graph.add_node(ds, source_id=cid)
@@ -34,9 +40,16 @@ def test_duplicate_zip_paths_and_explicit_2wiki_repairs(tmp_path, monkeypatch):
             for name, value in entries.items():
                 content = value if isinstance(value, str) else json.dumps(value)
                 if ds == "2wiki" and name in public.REPAIRS:
-                    z.writestr("large_scale_lightrag/"+public.REPAIRS[name], content)
+                    write_member(public.REPAIRS[name], content)
                     content = "{}"  # known incomplete canonical file must NOT be used
-                z.writestr("large_scale_lightrag/"+name, content)
+                write_member(name, content)
+    class LinuxZipFile(ZipFile):
+        def infolist(self):
+            members = super().infolist()
+            for member in members:
+                member.filename = member.orig_filename
+            return members
+    monkeypatch.setattr(public, "ZipFile", LinuxZipFile)
     monkeypatch.setattr(public, "SHA256", public.file_hash(path))
     manifest = public.import_public_indexes(path, tmp_path/"work")
     for ds in public.DATASETS:

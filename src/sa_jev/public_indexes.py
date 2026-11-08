@@ -126,12 +126,17 @@ def import_public_indexes(archive, root):
             entries[dataset] = {}
             for name in FILES:
                 actual = REPAIRS.get(name, name) if dataset == "2wiki" else name
-                members = [m for m in z.infolist() if m.filename == "large_scale_lightrag/" + actual]
+                # This Windows-created release stores backslashes. ZipInfo normalizes
+                # them on Windows, but not on Linux/Colab. Normalize for matching only;
+                # keep the original ZipInfo for opening duplicate members safely.
+                members = [m for m in z.infolist()
+                           if m.orig_filename.replace("\\", "/") == "large_scale_lightrag/" + actual]
                 if actual != name:
                     if len(members) != 1: raise ValueError("Ambiguous public repair artifact")
                     member = members[0]
                 else:
-                    if len(members) != 3: raise ValueError("Expected three distinct dataset occurrences")
+                    if len(members) != 3:
+                        raise ValueError(f"Expected three distinct dataset occurrences for {actual}; found {len(members)}")
                     member = members[index]
                 # Read the ZipInfo, NOT its repeated filename (which resolves to the last dataset).
                 with z.open(member) as src, (target/(name+".tmp")).open("wb") as dst:
