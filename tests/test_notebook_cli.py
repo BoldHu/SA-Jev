@@ -12,7 +12,8 @@ def test_notebook_cli_exposes_child_error_and_success_output(tmp_path, capsys):
     install = [c for c in nb["cells"] if c["cell_type"] == "code"][1]
     tree = ast.parse("".join(install["source"]))
     function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "cli")
-    namespace = {"ROOT": tmp_path, "sys": sys, "subprocess": subprocess}
+    namespace = {"ROOT": tmp_path, "CONFIG_PATH": repo/"configs/public_lightrag.yaml",
+                 "sys": sys, "subprocess": subprocess}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "notebook-cli", "exec"), namespace)
     with pytest.raises(RuntimeError, match="invalid choice") as error:
         namespace["cli"]("unknown-command-for-test")

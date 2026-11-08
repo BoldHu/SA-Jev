@@ -39,7 +39,7 @@ def require_retrieved(pool):
         raise ValueError("formal evaluation pool is missing corpus/retrieval provenance")
 
 
-async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fingerprint, mode="mix", extra=None, source_registry=None):
+async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fingerprint, mode="mix", extra=None, source_registry=None, chunk_registry=None):
     """mix preserves graph + vector retrieval; hybrid preserves local + global graph retrieval."""
     if mode not in {"mix", "hybrid"}: raise ValueError("keep native mixed/hybrid retrieval")
     config = {"mode": mode, "top_k": k, "chunk_top_k": k, "enable_rerank": False, **(extra or {})}
@@ -59,6 +59,12 @@ async def retrieve_once(rag, question_id, question_text, k, cache, *, corpus_fin
     evidence = []
     for chunk in response["data"]["chunks"]:
         if not chunk.get("chunk_id"): raise ValueError("LightRAG chunk missing traceable ID")
+        if chunk_registry is not None:
+            original = chunk_registry.get(str(chunk["chunk_id"]))
+            if original is None or original.text != chunk["content"]:
+                raise ValueError("Public retrieval chunk does not match its pinned source registry")
+            evidence.append(original)
+            continue
         source_id = chunk.get("file_path", "")
         original = (source_registry or {}).get(source_id)
         if source_registry is not None and original is None:

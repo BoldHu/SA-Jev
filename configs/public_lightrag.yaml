@@ -1,0 +1,80 @@
+seed: 17
+seeds:
+- 17
+- 29
+- 43
+model:
+  artifact: shenjunhao/OpenJev-4B
+  revision: 064bd435c6713486450194e29d526266b28941e2
+  device: cuda
+  branch_microbatch: 1
+  lora_rank: 16
+  lora_alpha: 32
+  max_branch_length: 8192
+  max_decision_tokens: 65536
+retrieval:
+  mode: mix
+  max_k: 256
+  llm_model: DeepSeek-V4.1-Flash
+  embedding_backend: local
+  embedding_model: sentence-transformers/all-MiniLM-L6-v2
+  embedding_revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+  embedding_dim: 384
+  embedding_device: auto
+  embedding_batch_size: 16
+  embedding_max_length: 256
+  embedding_query_prefix: ''
+  chunk_tokens: 1200
+  chunk_overlap: 100
+data:
+  train_counts:
+    hotpotqa: 8000
+    musique: 4000
+  main_k: 32
+  budget: 4
+  mine_hard_candidates: true
+  dense_mining: false
+  validation_per_dataset: 100
+  heldout_per_dataset: 300
+training:
+  epochs: 1
+  accumulation: 8
+  learning_rate: 2.0e-05
+  head_learning_rate: 0.0001
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  dpo_weight: 0.2
+  stability_weight: 0.1
+  beta: 0.1
+  tolerance: 0.05
+  stability_warmup_steps: 100
+  validate_every: 100
+  save_every: 100
+  memory_limit_gib: 79.0
+evaluation:
+  efficiency_max_decision_tokens: 262144
+  threshold: 0.5
+  answer_model: DeepSeek-V4.1-Flash
+  jev_model: jev-1.13.0
+  repeats: 3
+  k_values:
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  main_methods:
+  - retrieval_order
+  - static_jev
+  - dynamic_jev
+  - state_filtered_jev
+  - openjev_frozen
+  - stage1
+  - full
+  stability_weights:
+  - 0.0
+  - 0.05
+  - 0.1
+  - 0.2
+  perturbation_states: 600
+protocol: public_lightrag_n500_v1

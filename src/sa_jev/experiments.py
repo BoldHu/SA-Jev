@@ -22,7 +22,7 @@ from .reporting import export_report, training_report, csv_rows
 from .evaluation import OfficialJev, Answerer, evaluate, repeat_diagnostics
 
 
-def load_config(path="configs/research.yaml"):
+def load_config(path="configs/public_lightrag.yaml"):
     with Path(path).open(encoding="utf-8") as f: return yaml.safe_load(f)
 
 
@@ -45,6 +45,9 @@ def environment_manifest(output, config=None):
 
 
 async def cache_pools(root, config, limit=None):
+    if config.get("protocol") == "public_lightrag_n500_v1":
+        from .public_indexes import cache_public_pools
+        return await cache_public_pools(root, config, limit)
     root = Path(root); data = root/"data"; cfg = config["retrieval"]
     corpus = [Evidence(**r) for r in read_jsonl(data/"corpus.jsonl")]
     questions = [q for q in read_questions(root) if q.split != "train"]

@@ -34,9 +34,11 @@ if SYNC_GIT and (PROJECT / '.git').exists():
         subprocess.run(['git', '-C', str(PROJECT), 'pull', '--ff-only'], check=True)
 os.chdir(PROJECT)
 MODE = 'pilot'  # Change to 'full' only after the pilot completes and memory is measured.
-ROOT = DRIVE / MODE
+ROOT = DRIVE / 'public_lightrag_v1' / MODE
 ROOT.mkdir(parents=True, exist_ok=True)
 os.environ['HF_HOME'] = str(DRIVE / 'huggingface')
+PUBLIC_ASSETS = DRIVE / 'public_lightrag_assets'
+CONFIG_PATH = PROJECT / 'configs/public_lightrag.yaml'
 print('Code:', PROJECT, 'Artifacts:', ROOT)
 '''
 
@@ -58,12 +60,12 @@ import sa_jev
 print('SA-Jev source:', sa_jev.__file__)
 # If package installation asks for a runtime restart, restart before importing torch.
 from sa_jev.experiments import load_config, environment_manifest
-config = load_config()
+config = load_config(CONFIG_PATH)
 environment_manifest(ROOT / 'environment.json', config)
 def cli(command, *args):
     from collections import deque
     tail = deque(maxlen=40)
-    cmd = [sys.executable, '-u', '-m', 'sa_jev.cli', command, '--root', str(ROOT), *map(str,args)]
+    cmd = [sys.executable, '-u', '-m', 'sa_jev.cli', command, '--root', str(ROOT), '--config', str(CONFIG_PATH), *map(str,args)]
     with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
         try:
@@ -111,13 +113,13 @@ def create(name, title, content):
     nbf.write(notebook,target)
 
 
-create('00_environment_data.ipynb', '# SA-Jev · 环境与数据准备\n先运行 MODE=pilot，产物保存到 MyDrive/SA-Jev/pilot；改为 full 后另存 full 目录。CPU 可运行，不训练 OpenJev-4B。pilot 每个源文件 64 条，不是完整论文数据，也不下载 2Wiki。流程成功生成本次 00_complete.json 后，默认刷新 Drive 写入并释放 Colab 运行时。首个代码单元的 AUTO_DISCONNECT=False 可关闭自动断开。', [
+create('00_environment_data.ipynb', '# SA-Jev · 公开 LightRAG 索引与数据准备\n默认使用三套公开 N500 图，不对训练段落重新付费建图。产物保存到 MyDrive/SA-Jev/public_lightrag_v1/pilot 或 full；旧 full 目录保留。full 表示完整研究协议：8,000+4,000 道训练题、每数据集 500 道公开测试题，不表示 benchmark 全测试集。CPU 可运行，下载约 561 MB 索引和小型 MiniLM；不下载 OpenJev-4B。首次先跑 pilot；成功结束后默认刷新 Drive 并断开。', [
 ('code', "import torch\nfrom sa_jev.smoke import run_fresh\n# Execute in the notebook so any failure shows its original traceback.\nsmoke_result = run_fresh(ROOT, device='cuda' if torch.cuda.is_available() else 'cpu')\nsmoke_result"),
-('md', '本地向量编码器：首次运行下载固定版本的 BAAI/bge-small-en-v1.5（384 维），缓存到 Drive/huggingface；之后复用。加载前校验官方权重大小和 SHA-256；损坏时隔离该缓存文件，并自动重下同一版本一次，校验仍失败则停止。不会删除原始数据或图谱。此检查不调用聊天/向量 API，自动使用 GPU，无 GPU 时用 CPU。文本抽取与最终回答继续使用 LLM API。'),
+('md', '公开图的向量编码器为 all-MiniLM-L6-v2（384 维、256 token），与 BGE 不兼容。本地下载固定版本，仅用于查询和兼容性检查，不调用 embedding API。源发布未记录编码器 revision，加载图后用已存向量进行兼容性校验。'),
 ('code', "from sa_jev.embeddings import check_embeddings\nembedding_check = await check_embeddings(config['retrieval'], ROOT/'embedding_check.json')\nembedding_check"),
-('md', '下载原始数据：pilot 每个文件 64 条；full 读取完整源。2Wiki 的官方 dev.json 另置于 ROOT/raw/2wiki_dev.json。MuSiQue 两种官方格式均受支持。'),
-('code', "from time import perf_counter\nfrom sa_jev.preparation import download_sources, download_2wiki, normalize_sources\nprepare_started = perf_counter()\nprint(f'[1/3] Download HotpotQA and MuSiQue: MODE={MODE}, directory={ROOT / \"raw\"}', flush=True)\ndownload_sources(ROOT/'raw', limit=64 if MODE=='pilot' else None)\nif MODE=='full':\n    print('[2/3] Download and extract official 2Wiki data...', flush=True)\n    download_2wiki(ROOT/'raw')\nelse:\n    print('[2/3] Pilot: skip 2Wiki.', flush=True)\nprint('[3/3] Reuse completed normalization, or prepare changed/missing data...', flush=True)\n# Subsequent cells load their own data; avoid loading all cached questions here.\nquestions, manifest = normalize_sources(ROOT/'raw', ROOT/'data', load_questions=False)\nprint(f'Download/normalization complete in {perf_counter()-prepare_started:.1f}s. Graph indexing is the next cell.', flush=True)\nmanifest"),
-('md', '固定 LightRAG 混合召回。原始段落统一入库，不索引答案或标签。向量使用本地 BGE 编码器，文本抽取调用 LLM API。先检查 configs/research.yaml。旧 API 向量索引不能复用；切换建图模型或编码器后使用新的实验 ROOT，重建索引和候选池。首次建图通常比训练 pilot 更耗时。'),
+('md', '下载并校验公开 ZIP，按重复条目分别导入三套图；2Wiki 使用包内完整冲突副本，详见 public_manifest.json。复用旧 full/raw 下载（若完整），否则下载原始训练源。仅采样训练问题的段落用于 BM25 难例，不调用建图 API。公开 500 题全部保留为测试；另从未用的 HippoRAG 问题族取验证与独立扰动题，不注入缺失支持证据。'),
+('code', "from sa_jev.public_indexes import download_public_assets, import_public_indexes, prepare_public_data\nfrom sa_jev.preparation import download_sources\nfrom sa_jev.io import read_json\narchive = download_public_assets(PUBLIC_ASSETS)\nindex_manifest = import_public_indexes(archive, ROOT)\nraw = ROOT/'raw'\nlegacy = DRIVE/'full/raw'\nif MODE == 'full' and (legacy/'download_manifest.json').exists() and read_json(legacy/'download_manifest.json').get('formal'):\n    raw = legacy\n    print('Reusing existing source downloads:', raw)\ndownload_sources(raw, limit=64 if MODE=='pilot' else None)\nmanifest = prepare_public_data(ROOT, PUBLIC_ASSETS, raw, config, mode=MODE)\nmanifest"),
+('md', '在导入的三个图上执行 LightRAG 原生 mix（图＋向量）召回，缓存最大 K=256，再切片得到主实验 K=32。保留已发布图，不重新抽取文档；查询关键词提取仍会调用 .env 中的 DeepSeek。完整协议有 2,300 个查询（1,500 测试、200 验证、600 独立保留），pilot 18 个。初始缓存完成后，其余 notebook 复用候选。检查 public_pool_coverage.csv；缺失支持、未知标签仍掩蔽。'),
 ('code', "from sa_jev.experiments import cache_pools\nawait cache_pools(ROOT, config)"),
 ('code', "from sa_jev.preparation import prepare_tasks\nprepare_tasks(ROOT/'data', counts=config['data']['train_counts'], mine=True, dense=config['data']['dense_mining'])"),
 ('md', '训练前完整扫描公开 OpenJevData。检出的重叠保留记录并在论文报告；未检出不代表证明完全未见。此步骤不使用独立扰动测试集调参。'),

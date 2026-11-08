@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="SA-Jev reproducible research commands")
     parser.add_argument("command", choices=["smoke", "normalize", "download", "cache-pools", "prepare-tasks", "overlap", "train", "main", "diagnostics", "efficiency", "robustness", "review-packets", "industrial-download"])
     parser.add_argument("--root", default="outputs/research")
-    parser.add_argument("--config", default="configs/research.yaml")
+    parser.add_argument("--config", default="configs/public_lightrag.yaml")
     parser.add_argument("--limit", type=int)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--device", default="cpu")

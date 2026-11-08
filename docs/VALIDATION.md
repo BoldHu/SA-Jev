@@ -6,6 +6,11 @@
 
 | 检查 | 实际结果 | 可追溯输出 |
 |---|---|---|
+| 公开索引适配完整回归 | **57 passed**（154.77s）。包含重复 ZIP 路径分离、2Wiki 完整副本选择、来源追踪、编码器不匹配拒绝、完整 500×3 测试题划分和问题族隔离、9 个 notebook 格式与语法，以及原两阶段训练契约。旧测试要求 notebook 无输出的约束改为允许保留用户真实日志；CLI 测试加入新的配置路径 | Conda SA-Jev：`torch.set_num_threads(2); pytest.main(['-q'])` |
+| 公开候选缓存复用最终检查 | 后续新增完整缓存快速复用后，相关 **12 passed**（5.80s）。清单、问题、配置、图绑定和所有池文件齐备时不再加载编码器/图、不再调用 API；原准备失败/完成条件检查仍通过 | `pytest -q tests/test_public_indexes.py tests/test_preparation_resume.py` |
+| 公开 LightRAG 索引真实导入 | 下载并验证固定 ZIP SHA-256，按重复 ZipInfo 分开导入三套图；2Wiki 使用包内完整冲突副本。实际文档数 HotpotQA 4,927、MuSiQue 7,674、2Wiki 3,258。真实 MiniLM 与每图三个分块的已存向量余弦匹配（接近 1）。查询前后图、向量、原文、分块文件哈希不变 | `outputs/public_index_inspection/public_oqp5aaw8/index/public_manifest.json`、`unchanged_public_artifacts.json` |
+| 新协议小规模端到端 | 真实原始数据采样 8 道训练题，24 个任务状态、19 对偏好；18 个公开题原生 mix 候选缓存、12 个验证状态。tiny 模型 Stage 1/2 各 2 步，冻结参考与 DPO 路径运行，6 题评测均 status=ok，生成 CSV 与 PNG/PDF。查询关键词使用确定性夹具，外部 API 调用为 0。验证 rank 全掩蔽，不能作为排序学习或鲁棒性证据；不是 4B 论文结果 | `scripts/check_public_indexes.py`；`outputs/public_index_inspection/public_oqp5aaw8/verification.json` |
+| 新协议真实 DeepSeek 查询 | 本地当前 .env，DeepSeek-V4.1-Flash 查询 HotpotQA 公开图，原生 mix 实际返回 K=256，全部候选有原文来源；查询耗时 7.87 秒（不含加载）。文档抽取调用为 0，未生成最终答案。仅一题，不推算正式吞吐、费用或论文性能 | `scripts/check_public_live.py`；`outputs/public_index_inspection/public_oqp5aaw8/live_verification.json` |
 | Conda 环境 | 新建 `SA-Jev`；Python 3.11.18、PyTorch 2.6.0+cu118；RTX 3050 Laptop 4GB 可用 | `docs/validation_environment.json` |
 | 此前完整测试套件 | **23 passed，1 failed**（约 81.89s）；唯一失败是本地 `00` notebook 保留用户运行输出，不满足源码 notebook 应无输出的检查；未删除用户日志。smoke 重入、子进程错误显示与环境文件检查均通过 | `python -m pytest -q` |
 | 全量准备前回归检查 | 本次 **29 passed，1 deselected**（49.30s）；包括失败写入不覆盖完整文件、失败建图不写完成标记、重跑仅补未完成文档、00 完成标记的前置条件。跳过要求用户 notebook 输出为空的旧检查；9 个 notebook 的格式及代码语法另行通过。未跑真实全量语料 | `pytest -q -k "not notebook_cells_parse_and_outputs_empty"` |

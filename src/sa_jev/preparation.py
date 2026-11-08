@@ -254,6 +254,8 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
     write_jsonl(directory / "validation_states.jsonl", validation)
     manifest = {"training_questions": len(training), "task_states": len(states), "preferences": len(pairs),
                 "validation_states": len(validation), "rank_valid": sum(x.labels.rank_valid for x in states),
+                "validation_rank_valid": sum(x.labels.rank_valid for x in validation),
+                "validation_suf_valid": sum(x.labels.suf_valid for x in validation),
                 "suf_valid": sum(x.labels.suf_valid for x in states),
                 "rel_valid": sum(sum(x.labels.rel_valid) for x in states),
                 "requested_k_counts": {k: sum(x.state.pool.provenance["requested_k"] == k for x in states if not x.state.selected_ids) for k in (8, 16, 32, 64)},
@@ -261,6 +263,9 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
                 "state_fingerprint": digest(states), "preference_fingerprint": digest(pairs),
                 "unknown_labels": "masked; short pools are never padded"}
     write_json(directory / f"task_manifest{suffix}.json", manifest)
+    if validation and not manifest["validation_rank_valid"]:
+        print("Validation has no fully known ranking targets; rank loss is unavailable. "
+              "Inspect pool coverage/annotations before interpreting ranking validation; unknowns remain masked.", flush=True)
     return manifest
 
 
@@ -274,7 +279,10 @@ def finish_preparation(root, config, *, mode=None, run_id=None):
     tasks = read_json(data / "task_manifest.json")
     audit = read_json(data / "overlap_audit.json")
     pools = read_json(data / "pool_cache_manifest.json")
-    read_json(root / "index/corpus_manifest.json")
+    if config.get("protocol") == "public_lightrag_n500_v1":
+        read_json(root / "index/public_manifest.json")
+    else:
+        read_json(root / "index/corpus_manifest.json")
     expected = digest({"retrieval": config["retrieval"], "main_k": config["data"]["main_k"]})
     if not pools["complete"] or pools["config_fingerprint"] != expected:
         raise ValueError("candidate preparation is incomplete or uses a different retrieval configuration")
