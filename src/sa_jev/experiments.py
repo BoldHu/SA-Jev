@@ -106,6 +106,8 @@ def load_method(root, config, method, seed):
 
 
 def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resume=None, validation_limit=None):
+    from .public_indexes import require_public_question_protocol
+    require_public_question_protocol(root, config)
     if variant not in {"stage1", "full", "dpo", "stability", "small_stage1", "small_k"} and not variant.startswith("stab_weight_"):
         raise ValueError("unknown training ablation")
     root = Path(root); data = root/"data"

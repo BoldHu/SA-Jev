@@ -105,6 +105,18 @@ def test_public_router_never_ingests_training_corpus(tmp_path, monkeypatch):
     assert calls == [(tmp_path,3)]
 
 
+def test_partial_pool_cache_resume_is_idempotent_and_rejects_changes(tmp_path):
+    from sa_jev.schema import Pool
+    pool = Pool("q", (Evidence.make("Title", "text"),), "fixture", {"config": "fixed"})
+    cache = PoolCache(tmp_path)
+    cache.write(pool)
+    before = cache.path("q").read_bytes()
+    cache.write(cache.read("q"))
+    assert cache.path("q").read_bytes() == before
+    with pytest.raises(ValueError, match="different contents"):
+        cache.write(replace(pool, provenance={"config": "changed"}))
+
+
 def test_public_notebooks_are_isolated_and_never_rebuild():
     import ast
     for path in Path("notebooks").glob("*.ipynb"):
@@ -120,7 +132,7 @@ def test_public_notebooks_are_isolated_and_never_rebuild():
             assert "download_2wiki(" not in joined
 
 
-def test_full_question_protocol_keeps_500_tests_and_disjoint_roles(tmp_path, monkeypatch):
+def test_full_question_protocol_splits_only_published_500_and_disjoint_roles(tmp_path, monkeypatch):
     from sa_jev import data
     from sa_jev.schema import Question
     from sa_jev.io import write_jsonl, read_jsonl
@@ -142,13 +154,27 @@ def test_full_question_protocol_keeps_500_tests_and_disjoint_roles(tmp_path, mon
         rows.append({"id":"duplicate", "question":ds+" question 0"})
         write_jsonl(raw/name, rows)
     config={"seed":17,"data":{"train_counts":{"hotpotqa":2,"musique":2},
-                              "validation_per_dataset":100,"heldout_per_dataset":300}}
+                              "validation_per_dataset":100,"heldout_per_dataset":100}}
     manifest=public.prepare_public_data(root,assets,raw,config,mode="full")
-    assert manifest["splits"] == {"train":4,"validation":200,"test":1500,"heldout":600}
+    assert manifest["splits"] == {"train":4,"validation":200,"test":1100,"heldout":200}
     rows=list(read_jsonl(root/"data/questions.jsonl"))
     assert not any(q["id"].endswith(":duplicate") for q in rows)
     assert all(q["split"]=="test" for q in rows if q["dataset"]=="2wiki")
+    assert all(int(q["id"].split(":")[1]) < 500 for q in rows if q["split"] != "train")
     assert public.prepare_public_data(root,assets,raw,config,mode="full")==manifest
+    # Upgrade a legacy manifest in place without touching downloaded graphs/pools.
+    old = {**manifest, "preparation_binding": {"old": True}}
+    old.pop("question_protocol")
+    write_json(root/"data/data_manifest.json", old)
+    write_json(root/"data/train_states.jsonl", {"old": "derived data"})
+    write_json(root/"00_complete.json", {"old": "completion"})
+    write_json(root/"data/pools/keep.json", {"cached": "pool"})
+    before = (root/"data/pools/keep.json").read_bytes()
+    assert public.prepare_public_data(root,assets,raw,config,mode="full")==manifest
+    assert (root/"data/pools/keep.json").read_bytes() == before
+    assert not (root/"00_complete.json").exists()
+    assert not (root/"data/train_states.jsonl").exists()
+    assert list((root/"protocol_archive").glob("*/train_states.jsonl"))
 
 
 def test_completed_public_pools_reuse_without_loading_models(tmp_path, monkeypatch):
@@ -159,7 +185,7 @@ def test_completed_public_pools_reuse_without_loading_models(tmp_path, monkeypat
     q=fixture_questions()[2]
     write_jsonl(tmp_path/"data/questions.jsonl",[q])
     write_json(tmp_path/"index/public_manifest.json", {"release":"fixture"})
-    write_json(tmp_path/"data/data_manifest.json", {"question_fingerprint":"questions"})
+    write_json(tmp_path/"data/data_manifest.json", {"question_fingerprint":"questions", "question_protocol":public.QUESTION_PROTOCOL})
     config={"retrieval":{},"data":{"main_k":8}}
     pool=Pool(q.id,q.evidence,"fixture",{})
     for name in ("pools","pools_max"): PoolCache(tmp_path/"data"/name).write(pool)
@@ -169,4 +195,58 @@ def test_completed_public_pools_reuse_without_loading_models(tmp_path, monkeypat
     write_json(tmp_path/"data/pool_cache_manifest.json",marker)
     async def forbidden(**kwargs):raise AssertionError("must not load encoder or call service")
     monkeypatch.setattr(embeddings,"make_embedding_func",forbidden)
+    monkeypatch.setattr(public,"public_support_coverage",lambda *a: None)
     assert asyncio.run(public.cache_public_pools(tmp_path,config))==marker
+
+
+def test_old_question_split_rejected_before_paid_retrieval(tmp_path, monkeypatch):
+    write_json(tmp_path/"data/data_manifest.json", {"question_fingerprint":"old"})
+    config={"protocol":"public_lightrag_n500_v1"}
+    with pytest.raises(ValueError, match="Obsolete public question split"):
+        asyncio.run(public.cache_public_pools(tmp_path,config))
+
+
+def test_protocol_archive_can_resume_after_interruption(tmp_path, monkeypatch):
+    previous = {"question_fingerprint": "legacy"}
+    for name in ("data_manifest.json", "questions.jsonl", "train_states.jsonl"):
+        write_json(tmp_path/"data"/name, previous)
+    write_json(tmp_path/"00_complete.json", previous)
+    original = Path.replace
+    def interrupted(path, target):
+        if path.name == "train_states.jsonl": raise OSError("simulated interruption")
+        return original(path, target)
+    monkeypatch.setattr(Path, "replace", interrupted)
+    with pytest.raises(OSError, match="interruption"):
+        public._archive_question_protocol(tmp_path, previous)
+    assert (tmp_path/"data/data_manifest.json").exists()
+    monkeypatch.setattr(Path, "replace", original)
+    public._archive_question_protocol(tmp_path, previous)
+    assert not (tmp_path/"data/data_manifest.json").exists()
+    assert len(list((tmp_path/"protocol_archive").glob("*/*"))) == 4
+
+
+def test_public_roles_keep_entire_shared_family_in_one_split():
+    from sa_jev.smoke import fixture_questions
+    q = fixture_questions()[0]
+    questions = [replace(q,id=f"hotpotqa:{i}",group_id=f"family:{i//2}",dataset="hotpotqa") for i in range(12)]
+    questions += [replace(q,id=f"musique:{i}",group_id=f"mu:{i}",dataset="musique") for i in range(12)]
+    questions += [replace(q,id="2wiki:0",group_id="family:0",dataset="2wiki")]
+    selected=public._published_roles(questions,{q.id for q in questions},
+                {"seed":17,"data":{"validation_per_dataset":2,"heldout_per_dataset":2}},"full")
+    roles={}
+    for row in selected:
+        assert roles.setdefault(row.group_id,row.split)==row.split
+    assert roles['family:0']=='test'
+
+
+def test_source_coverage_rejects_outside_questions_and_reports_missing_support(tmp_path):
+    from sa_jev.smoke import fixture_questions
+    q=replace(fixture_questions()[0],id="hotpotqa:published",dataset="hotpotqa",split="validation")
+    for ds in public.DATASETS:
+        write_json(tmp_path/"index"/ds/"source_registry.json", {})
+        write_json(tmp_path/"index"/ds/"lightrag_contexts.json", {"published": "unused"})
+    with pytest.raises(ValueError,match="no fully supported"):
+        public.public_support_coverage(tmp_path,[q])
+    assert read_json(tmp_path/"data/public_source_coverage.json")["summary"][0]["all_support"]==0
+    with pytest.raises(ValueError,match="outside the published"):
+        public.public_support_coverage(tmp_path,[replace(q,id="hotpotqa:outside")])

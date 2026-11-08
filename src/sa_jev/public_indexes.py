@@ -25,6 +25,7 @@ QUERY_REVISION = "5ec05b38deecc3318bb432c69865959c56058990"
 DATASETS = ("hotpotqa", "musique", "2wiki")
 ENCODER = "sentence-transformers/all-MiniLM-L6-v2"
 ENCODER_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+QUESTION_PROTOCOL = "published_family_split_v2"
 FILES = ("graph_chunk_entity_relation.graphml", "kv_store_full_docs.json",
          "kv_store_text_chunks.json", "kv_store_full_entities.json", "kv_store_full_relations.json",
          "kv_store_entity_chunks.json", "kv_store_relation_chunks.json", "kv_store_doc_status.json",
@@ -164,24 +165,122 @@ def import_public_indexes(archive, root):
     return manifest
 
 
+def _published_roles(questions, published_ids, config, mode):
+    """Split published question families before retrieval; never select by model performance."""
+    groups = {}
+    for q in questions:
+        if q.id in published_ids:
+            groups.setdefault(q.group_id, []).append(q)
+    # Cross-dataset families touching 2Wiki stay test-only everywhere.
+    roles = {g: "test" for g, qs in groups.items() if any(q.dataset == "2wiki" for q in qs)}
+    for role, requested in (("validation", config["data"]["validation_per_dataset"] if mode == "full" else 2),
+                            ("heldout", config["data"]["heldout_per_dataset"] if mode == "full" else 4)):
+        for ds in ("hotpotqa", "musique"):
+            taken = sum(q.dataset == ds for g, qs in groups.items() if roles.get(g) == role for q in qs)
+            ordered = sorted(groups, key=lambda g: digest([config["seed"], QUESTION_PROTOCOL, role, g]))
+            for g in ordered:
+                if taken >= requested: break
+                if g not in roles and any(q.dataset == ds for q in groups[g]):
+                    roles[g] = role
+                    taken += sum(q.dataset == ds for q in groups[g])
+            if taken < requested:
+                raise ValueError(f"Not enough published families for {ds}/{role}; reduce split counts")
+    selected = []
+    for ds in DATASETS:
+        tests = sorted((q for qs in groups.values() for q in qs if q.dataset == ds
+                        and roles.get(q.group_id, "test") == "test"), key=lambda q: q.id)
+        if not tests: raise ValueError(f"No published test questions remain for {ds}")
+        selected.extend(replace(q, split="test") for q in (tests if mode == "full" else tests[:2]))
+        selected.extend(replace(q, split=roles[g]) for g, qs in groups.items()
+                        if roles.get(g) in {"validation", "heldout"} for q in qs if q.dataset == ds)
+    return selected
+
+
+def _archive_question_protocol(root, previous):
+    """Move derived top-level data files aside; preserve immutable pools, graphs and raw sources."""
+    directory = root / "data"
+    archive = root / "protocol_archive" / digest(previous)[:16]
+    archive.mkdir(parents=True, exist_ok=True)
+    paths = [p for p in directory.iterdir() if p.is_file() and p.suffix in {".json", ".jsonl", ".csv"}]
+    paths += [root / "00_complete.json"] if (root / "00_complete.json").exists() else []
+    # Keep the legacy manifest until all other files are archived. An interruption
+    # then re-enters this migration and moves only the remaining files.
+    paths.sort(key=lambda p: (p.name == "data_manifest.json", p.name))
+    for path in paths:
+        target = archive / path.name
+        if target.exists():
+            raise ValueError(f"Migration archive already contains {target}; inspect before resuming")
+        path.replace(target)
+    print(f"Archived previous question protocol: {archive}. Existing graphs and candidate pools preserved.", flush=True)
+
+
+def require_public_question_protocol(root, config):
+    """Reject obsolete question lists before any paid retrieval or experiment."""
+    if config.get("protocol") != "public_lightrag_n500_v1": return
+    source = read_json(Path(root)/"data/data_manifest.json")
+    if source.get("question_protocol") != QUESTION_PROTOCOL:
+        raise ValueError("Obsolete public question split: stop this cell and rerun notebook 00 data preparation "
+                         "with updated code. It will preserve graphs/pools and archive old derived data; no API call made.")
+
+
+def public_support_coverage(root, questions):
+    """Read-only source coverage, distinct from retrieval recall and label-validity counts."""
+    from .schema import State, labels_for
+    rows, summary = [], []
+    for ds in DATASETS:
+        by_title = {}
+        published = set(read_json(Path(root)/"index"/ds/"lightrag_contexts.json"))
+        for value in read_json(Path(root)/"index"/ds/"source_registry.json").values():
+            e = Evidence(**value)
+            by_title.setdefault(normalize(e.title), []).append(e)
+        for q in questions:
+            if q.dataset != ds or q.split == "train": continue
+            if q.id.split(":", 1)[1] not in published:
+                raise ValueError(f"Question {q.id} is outside the published graph question list; no API calls made")
+            titles = {normalize(e.title) for e in q.evidence if q.coverage.get(e.id)}
+            evidence = deduplicate(e for t in sorted(titles) for e in by_title.get(t, ()))
+            pool = Pool(q.id, evidence, "coverage_audit_only")
+            # All-source coverage probe, not a policy rollout or a retrieval pool.
+            y = labels_for(q, State(q.id, q.group_id, q.question, pool, selected_ids=tuple(e.id for e in evidence)))
+            rows.append({"question_id": q.id, "dataset": ds, "split": q.split,
+                         "gold_complete": q.gold_complete, "covered_units": len(y.covered),
+                         "support_units": len(set(q.units)), "all_support": bool(y.sufficient and q.gold_complete)})
+        for split in ("validation", "heldout", "test"):
+            group = [r for r in rows if r["dataset"] == ds and r["split"] == split]
+            if not group: continue
+            item = {"dataset": ds, "split": split, "questions": len(group),
+                    "all_support": sum(r["all_support"] for r in group),
+                    "no_support": sum(r["covered_units"] == 0 for r in group)}
+            summary.append(item); print("Public source coverage:", item, flush=True)
+    report = {"scope": "exact source/text annotation transfer, not top-K retrieval recall", "summary": summary, "questions": rows}
+    write_json(Path(root)/"data/public_source_coverage.json", report)
+    if any(r["split"] in {"validation", "heldout"} and not r["all_support"] for r in summary):
+        raise ValueError("A validation/heldout subset has no fully supported questions in the public corpus; no API calls made")
+    return report
+
+
 def prepare_public_data(root, assets, raw, config, *, mode="pilot"):
-    """Public 500 questions stay test. Validation/heldout come from unused question families."""
+    """Train from original train data; all nontraining roles use published N500 families."""
     from .data import hotpot, musique, twowiki, split_questions, sample_training, audit_splits
     from .preparation import load_raw, _progress_rows
     root, assets, raw = Path(root), Path(assets), Path(raw)
     counts = config["data"]["train_counts"] if mode == "full" else config["data"].get("pilot_train_counts", {"hotpotqa": 32, "musique": 32})
     binding = {"protocol": "public_lightrag_n500_v1", "mode": mode, "counts": counts,
                "seed": config["seed"], "validation_per_dataset": config["data"]["validation_per_dataset"],
-               "heldout_per_dataset": config["data"]["heldout_per_dataset"],
+               "heldout_per_dataset": config["data"]["heldout_per_dataset"], "question_protocol": QUESTION_PROTOCOL,
                "queries": {ds: file_hash(assets/f"{ds}_queries.json") for ds in DATASETS},
                "raw": {ds: file_hash(raw/name) for ds, name in
                        (("hotpotqa", "hotpot_train.jsonl"), ("musique", "musique_ans_train.jsonl"))}}
     marker = root/"data/data_manifest.json"
     if marker.exists():
         previous = read_json(marker)
-        if previous.get("preparation_binding") != binding: raise ValueError("Prepared protocol changed; use a fresh ROOT")
-        if all((root/"data"/name).is_file() for name in ("questions.jsonl", "corpus.jsonl")):
-            return previous
+        if previous.get("preparation_binding") == binding:
+            if all((root/"data"/name).is_file() for name in ("questions.jsonl", "corpus.jsonl")):
+                return previous
+        elif previous.get("question_protocol") != QUESTION_PROTOCOL and previous.get("protocol") == binding["protocol"]:
+            _archive_question_protocol(root, previous)
+        else:
+            raise ValueError("Prepared protocol changed; use a fresh ROOT")
     public, test_ids = [], set()
     for ds, adapter in zip(DATASETS, (hotpot, musique, twowiki)):
         rows = read_json(assets/f"{ds}_queries.json")
@@ -197,38 +296,22 @@ def prepare_public_data(root, assets, raw, config, *, mode="pilot"):
     unique = {q.id: q for q in training_raw}
     unique.update({q.id: q for q in public})  # public/dev overrides any same-ID training row
     all_questions = split_questions(list(unique.values()), seed=config["seed"])
-    public_ids = {q.id for q in public}
-    test_groups = {q.group_id for q in all_questions if q.id in test_ids}
     selected = sample_training(all_questions, counts, config["seed"])
     chosen = Counter(q.dataset for q in selected)
     if any(chosen[ds] < n for ds, n in counts.items()): raise ValueError(f"Insufficient disjoint training data: {chosen}, need {counts}")
-    family_roles = {g: "test" for g in test_groups}
-    for ds in DATASETS:
-        candidates = sorted((q for q in all_questions if q.dataset == ds and q.id in public_ids and q.id not in test_ids
-                             and q.group_id not in test_groups), key=lambda q: digest([config["seed"], q.group_id, q.id]))
-        # 2Wiki remains cross-dataset test only: no validation or stability tuning on it.
-        if ds != "2wiki":
-            for role, n in (("validation", config["data"]["validation_per_dataset"] if mode == "full" else 2),
-                            ("heldout", config["data"]["heldout_per_dataset"] if mode == "full" else 4)):
-                available = [q for q in candidates if q.group_id not in family_roles]
-                taken = available[:n]
-                if len(taken) < n: raise ValueError(f"Insufficient independent {role} questions for {ds}")
-                selected.extend(replace(q, split=role) for q in taken)
-                family_roles.update({q.group_id: role for q in taken})
-        tests = sorted((q for q in all_questions if q.dataset == ds and q.id in test_ids), key=lambda q: q.id)
-        selected.extend(replace(q, split="test") for q in (tests if mode == "full" else tests[:2]))
+    selected.extend(_published_roles(all_questions, test_ids, config, mode))
     split_counts = audit_splits(selected)
     # Only sampled training context paragraphs enter BM25 hard-negative mining. No graph insertion.
     corpus = deduplicate(e for q in selected if q.split == "train" for e in q.evidence)
     write_jsonl(root/"data/questions.jsonl", selected)
     write_jsonl(root/"data/corpus.jsonl", corpus)
-    manifest = {"preparation_binding": binding, "protocol": binding["protocol"],
+    manifest = {"preparation_binding": binding, "protocol": binding["protocol"], "question_protocol": QUESTION_PROTOCOL,
                 "question_fingerprint": digest(selected), "corpus_fingerprint": digest(corpus),
                 "questions": len(selected), "corpus_documents": len(corpus), "splits": split_counts,
                 "dataset_splits": {ds: dict(Counter(q.split for q in selected if q.dataset == ds)) for ds in DATASETS},
                 "download": {"formal": mode == "full"},
-                "scope": "500 published test questions/dataset; training corpus is NOT graph-indexed",
-                "validation_scope": "unused HippoRAG question families on the fixed public graph; support may be absent",
+                "scope": "published N500 question families split into disjoint validation/heldout/test; 2Wiki test-only",
+                "validation_scope": "published question families only; missing supports retained and reported, never gold-injected",
                 "seed": config["seed"]}
     write_json(marker, manifest)
     print(manifest["dataset_splits"], flush=True)
@@ -290,12 +373,14 @@ async def cache_public_pools(root, config, limit=None, *, llm_func=None):
     from .retrieval import PoolCache, retrieve_once
     from .experiments import read_questions, slice_pool
     root = Path(root)
+    require_public_question_protocol(root, config)
     if not (root/"index/public_manifest.json").exists():
         raise ValueError("Public indexes are not imported in this ROOT. Run the updated notebook 00 import cell; "
                          "do not run ingestion on the old full directory.")
     imported = read_json(root/"index/public_manifest.json")
     source = read_json(root/"data/data_manifest.json")
     questions = [q for q in read_questions(root) if q.split != "train"]
+    public_support_coverage(root, questions)
     cache, main = PoolCache(root/"data/pools_max"), PoolCache(root/"data/pools")
     complete_path = root/"data/pool_cache_manifest.json"
     expected_config = digest({"retrieval": config["retrieval"], "main_k": config["data"]["main_k"]})
@@ -311,17 +396,23 @@ async def cache_public_pools(root, config, limit=None, *, llm_func=None):
     total = 0; started = time.perf_counter(); coverage_rows = []
     from .embeddings import make_embedding_func
     cfg = config["retrieval"]
-    embedding = await make_embedding_func(backend="local", model=cfg["embedding_model"], revision=cfg["embedding_revision"],
-                 dim=384, device=cfg["embedding_device"], batch_size=cfg["embedding_batch_size"], max_length=256, query_prefix="")
+    embedding = None
     for ds in DATASETS:
         selected = [q for q in questions if q.dataset == ds]
         if limit: selected = selected[:limit]
-        rag = await open_public_index(root, ds, config, embedding, llm_func=llm_func)
+        if not selected: continue
+        rag = None
         registry = {cid: Evidence(**row) for cid, row in read_json(root/"index"/ds/"source_registry.json").items()}
         binding = digest({"release": REVISION, "dataset": ds, "files": imported["files"][ds],
                           "query_llm": cfg["llm_model"], "embedding_revision": cfg["embedding_revision"]})
         try:
             for q in selected:
+                cached = cache.path(q.id).exists()
+                if not cached and rag is None:
+                    if embedding is None:
+                        embedding = await make_embedding_func(backend="local", model=cfg["embedding_model"], revision=cfg["embedding_revision"],
+                                     dim=384, device=cfg["embedding_device"], batch_size=cfg["embedding_batch_size"], max_length=256, query_prefix="")
+                    rag = await open_public_index(root, ds, config, embedding, llm_func=llm_func)
                 pool = await retrieve_once(rag, q.id, q.question, config["retrieval"]["max_k"], cache,
                            corpus_fingerprint=binding, mode=config["retrieval"]["mode"], chunk_registry=registry,
                            extra={"max_total_tokens": 180000, "max_entity_tokens": 20000, "max_relation_tokens": 20000})
@@ -333,13 +424,14 @@ async def cache_public_pools(root, config, limit=None, *, llm_func=None):
                                       "initial_rank_valid": label.rank_valid, "initial_suf_valid": label.suf_valid,
                                       "positive_candidates": sum(g > 0 for g in label.gains)})
                 elapsed = time.perf_counter()-started
-                print(f"Public pool {total}/{len(questions)} {ds}; K={len(pool.candidates)}; "
+                print(f"Public pool {total}/{len(questions)} {ds}; {'reused' if cached else 'new query'}; K={len(pool.candidates)}; "
                       f"ETA={(len(questions)-total)*elapsed/total:.0f}s; extraction calls=0", flush=True)
         finally:
-            await rag.finalize_storages()
+            if rag is not None: await rag.finalize_storages()
     from .reporting import csv_rows
     csv_rows(root/"data/public_pool_coverage.csv", coverage_rows)
     write_json(root/"data/pool_cache_manifest.json", {"complete": limit is None, "questions": total,
                "corpus_binding": digest(imported), "question_fingerprint": source["question_fingerprint"],
                "config_fingerprint": expected_config,
-               "protocol": "public_lightrag_n500_v1", "document_extraction_api_calls": 0})
+               "protocol": "public_lightrag_n500_v1", "question_protocol": QUESTION_PROTOCOL,
+               "document_extraction_api_calls": 0})

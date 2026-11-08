@@ -4,13 +4,16 @@ from __future__ import annotations
 from dataclasses import asdict, replace
 import torch
 from .schema import State, Labels, labels_for
-from .io import digest, write_jsonl
+from .io import digest, write_jsonl, write_json
+from pathlib import Path
 from .metrics import distribution_change, ndcg
 
 
 def review_packets(questions, states, output, limit=600):
     lookup = {q.id: q for q in questions}; rows = []
+    considered = 0
     for state in states:
+        considered += 1
         q = lookup[state.question_id]
         if q.split != "heldout": raise ValueError("robustness packets must use reserved question families")
         y = labels_for(q, state)
@@ -35,6 +38,12 @@ def review_packets(questions, states, output, limit=600):
                      "clean_labels": asdict(y), "perturbations": variants, "effective": changed})
         if len(rows) >= limit: break
     write_jsonl(output, rows)
+    counts = {"target_max_packets": limit, "considered_states": considered,
+              "draft_packets": len(rows), "unique_questions": len({r["clean"]["question_id"] for r in rows}),
+              "verified_packets": 0, "status": "draft_only_manual_review_required",
+              "note": "Multiple states may come from one reserved question; do not report the target as the achieved sample size."}
+    write_json(Path(output).with_suffix(".manifest.json"), counts)
+    print("Perturbation drafts:", counts, flush=True)
     return rows
 
 

@@ -35,7 +35,7 @@ data:
   mine_hard_candidates: true
   dense_mining: false
   validation_per_dataset: 100
-  heldout_per_dataset: 300
+  heldout_per_dataset: 100
 training:
   epochs: 1
   accumulation: 8

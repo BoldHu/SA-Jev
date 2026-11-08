@@ -22,8 +22,12 @@ class PoolCache:
     def write(self, pool):
         path = self.path(pool.question_id)
         payload = {"fingerprint": pool.fingerprint, "pool": asdict(pool)}
-        if path.exists() and read_json(path) != payload:
-            raise ValueError("fixed candidate cache already exists with different contents")
+        if path.exists():
+            # JSON turns tuples into lists; comparing the raw JSON with asdict(pool)
+            # incorrectly rejects an identical pool when resuming a partial run.
+            if self.read(pool.question_id).fingerprint != pool.fingerprint:
+                raise ValueError("fixed candidate cache already exists with different contents")
+            return
         write_json(path, payload)
 
     def read(self, question_id):

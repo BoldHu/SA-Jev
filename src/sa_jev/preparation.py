@@ -272,6 +272,8 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
 def finish_preparation(root, config, *, mode=None, run_id=None):
     """Write the notebook completion marker only after all preparation stages succeeded."""
     from datetime import datetime, timezone
+    from .public_indexes import require_public_question_protocol
+    require_public_question_protocol(root, config)
     root = Path(root); data = root / "data"
     source = read_json(data / "data_manifest.json")
     if mode == "full" and source.get("download", {}).get("formal") is not True:
