@@ -74,7 +74,7 @@ def test_bad_redownload_fails_without_loading_or_looping(tmp_path, monkeypatch, 
     assert calls == [True]
 
 
-def test_minilm_is_checked_before_sentence_transformer_loading(monkeypatch):
+def test_minilm_is_checked_before_sentence_transformer_loading(monkeypatch, tmp_path):
     import asyncio
     import sentence_transformers
     events = []
@@ -82,13 +82,76 @@ def test_minilm_is_checked_before_sentence_transformer_loading(monkeypatch):
     def validate(model, revision, cache):
         assert (model, revision) == (embeddings.MINILM_MODEL, embeddings.MINILM_REVISION)
         events.append("verified")
+        return tmp_path / "persistent" / "model.safetensors"
+
+    def stage(model, revision, weight, cache):
+        assert events == ["verified"]
+        assert weight == tmp_path / "persistent" / "model.safetensors"
+        events.append("staged")
+        return tmp_path / "local"
 
     def load(*args, **kwargs):
-        assert events == ["verified"]
+        assert events == ["verified", "staged"]
+        assert args[0] == str(tmp_path / "local")
+        assert kwargs["local_files_only"] is True
+        assert "revision" not in kwargs and "cache_folder" not in kwargs
         raise RuntimeError("stop after verified weight reaches loader")
 
     monkeypatch.setattr(embeddings, "ensure_embedding_weights", validate)
+    monkeypatch.setattr(embeddings, "stage_embedding_snapshot", stage)
     monkeypatch.setattr(sentence_transformers, "SentenceTransformer", load)
     with pytest.raises(RuntimeError, match="stop after verified"):
         asyncio.run(embeddings.make_embedding_func(model=embeddings.MINILM_MODEL,
                     revision=embeddings.MINILM_REVISION, device="cpu", max_length=256))
+
+
+def test_local_snapshot_materializes_verified_bytes_and_reuses_weight(tmp_path, monkeypatch):
+    import torch
+    from safetensors.torch import save_file, load_file
+    from huggingface_hub.errors import LocalEntryNotFoundError
+
+    source = tmp_path / "persistent" / "model.safetensors"
+    source.parent.mkdir()
+    save_file({"weight": torch.arange(6).reshape(2, 3)}, source)
+    original = source.read_bytes()
+    monkeypatch.setattr(embeddings, "MINILM_WEIGHT_BYTES", len(original))
+    monkeypatch.setattr(embeddings, "MINILM_WEIGHT_SHA256", hashlib.sha256(original).hexdigest())
+    monkeypatch.setattr(embeddings.tempfile, "gettempdir", lambda: str(tmp_path / "runtime"))
+    metadata = source.parent / "metadata.txt"
+    metadata.write_text('{}', encoding="utf-8")
+    calls = []
+
+    def download(**kwargs):
+        assert kwargs["filename"] != "model.safetensors", "staging must reuse verified weights"
+        calls.append((kwargs["filename"], kwargs.get("local_files_only", False)))
+        if kwargs["filename"] == "vocab.txt" and kwargs.get("local_files_only") and len(calls) < 10:
+            raise LocalEntryNotFoundError("simulate uncached small tokenizer metadata")
+        return str(metadata)
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", download)
+    model, revision = embeddings.MINILM_MODEL, embeddings.MINILM_REVISION
+    local = embeddings.stage_embedding_snapshot(model, revision, source, str(source.parent))
+    target = local / "model.safetensors"
+    assert not target.is_symlink()
+    assert target.read_bytes() == original == source.read_bytes()
+    assert torch.equal(load_file(target)["weight"], torch.arange(6).reshape(2, 3))
+    assert (local / "1_Pooling/config.json").is_file()
+    assert ("vocab.txt", False) in calls
+    timestamp = target.stat().st_mtime_ns
+    embeddings.stage_embedding_snapshot(model, revision, source, str(source.parent))
+    assert target.stat().st_mtime_ns == timestamp, "valid local weight should not be recopied"
+    assert source.read_bytes() == original
+
+
+def test_bad_runtime_copy_stops_before_loading_or_downloading_metadata(tmp_path, monkeypatch):
+    source = tmp_path / "changed_source.safetensors"
+    source.write_bytes(b"79-byte-pointer-or-changed-source")
+    monkeypatch.setattr(embeddings.tempfile, "gettempdir", lambda: str(tmp_path / "runtime"))
+
+    def forbidden(**kwargs):
+        raise AssertionError("must stop before metadata download or model loading")
+
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", forbidden)
+    with pytest.raises(RuntimeError, match="Local embedding copy failed checksum"):
+        embeddings.stage_embedding_snapshot(embeddings.MINILM_MODEL, embeddings.MINILM_REVISION, source)
+    assert source.read_bytes() == b"79-byte-pointer-or-changed-source"

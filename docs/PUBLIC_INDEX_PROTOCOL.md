@@ -32,6 +32,8 @@ MuSiQue 的一条图边没有对应关系向量，保持原样并报告，不宣
 上游图抽取模型是 `llama-3.1-8b-instant`。我们的 DeepSeek 只用于新查询关键词和最终回答；不能声称这些图由 DeepSeek 构建。
 上游编码器为 `all-MiniLM-L6-v2`，未记录模型 revision；本地固定 `sentence-transformers/all-MiniLM-L6-v2@1110a243fdf4706b3f48f1d95db1a4f5529b4d41`，256 token、384 维、无 BGE 查询前缀。每次打开索引比较三个已有分块的向量余弦，相似度低于 0.995 则停止。该检查验证抽样兼容性，不证明上游版本身份。
 
+编码器加载兼容修复（2026-11-11）：Drive 权重即使顺序读取的 SHA-256 正确，也不能由此确认模型实际解析的缓存路径或内存映射读取正常。固定 MiniLM/BGE 现在将已校验权重及必要的小型配置/分词文件复制到运行时临时目录 `sajev_embedding_models/`，不复制软链接；本地副本再次核对大小、SHA-256 和 safetensors 解析，再由 SentenceTransformer 使用该显式目录和 `local_files_only=True` 加载。Drive 下载缓存仍保留，新连接只需重新复制；此修复不改变模型身份、向量设置、公开图或候选池。日志打印实际加载目录。已在本地用真实 MiniLM 离线验证，尚未在用户 Colab 上验证其具体 Drive 故障。
+
 ## 数据与泄漏边界
 
 1. 完整训练仍从官方 train 中选 HotpotQA 8,000、MuSiQue 4,000 题。先将官方训练题与所有公开评测题联合按问题族及规范化问题文本隔离，再采样。训练原始上下文与 BM25 难例构造方式保持原协议；这些段落不进入公开图。

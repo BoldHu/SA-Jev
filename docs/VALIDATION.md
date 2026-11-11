@@ -1,11 +1,12 @@
 # 实际验证记录
 
-日期：2026-11-07 至 2026-11-08（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
+日期：2026-11-07 至 2026-11-11（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
 
 ## 已运行
 
 | 检查 | 实际结果 | 可追溯输出 |
 |---|---|---|
+| 编码器校验与实际加载路径绑定 | **14 passed**（38.85s），覆盖持久缓存修复、本地普通文件物化、仅补缺失的小元数据、本地权重复用、复制失败拒绝加载、SentenceTransformer 显式离线路径。真实 MiniLM 全程离线 CPU 加载/编码通过，直接加载与本地副本向量最大差 **0.0**；三套公开图各三个已存向量兼容检查最小 cosine 日志均为 1.000000。持久权重 SHA-256 不变，无权重下载、无 API。00 编码器格重载模块，格式语法通过，历史输出/执行次数保留。未复现用户 Drive 具体故障，不将路径/映射推断称为已确认根因 | `outputs/embedding_local_snapshot_gh9tj7vq/verification.json`；`pytest -q tests/test_embedding_weight_repair.py tests/test_local_embeddings.py` |
 | 任务加工进度输出 | 为 prepare_tasks 添加 8 个阶段提示、读写计数；BM25 分词/查询、任务状态与轨迹偏好添加进度及吞吐/ETA。用真实教学题派生的 3 训练＋1 验证夹具对比 Git HEAD 修改前实现，任务状态、偏好、验证状态及 manifest 四个文件逐字节一致；全部阶段日志出现。相关现有测试 **20 passed**（8.57s）。无 API、无正式训练，未测 full 耗时；索引构建和整体指纹计算只提供开始提示，不承诺持续心跳 | `outputs/task_progress_m9h8_1gw/verification.json`、`after.log`；`pytest -q tests/test_research_contract.py tests/test_download_progress.py tests/test_preparation_resume.py` |
 | 00 从头运行前最终检查 | **34 passed**（8.77s）：公开题划分/迁移与中断恢复、缓存复用、MiniLM 校验修复、环境文件、子进程日志及完成后释放。另校验 00 的格式/代码语法与 full 配置。发现用户 notebook 残留三段一次性修复（ZIP 路径补丁、无条件重下 MiniLM、从 Drive ZIP 覆盖源码），已将活动单元改为提示跳过，原代码保存在单元 metadata，历史输出/执行次数与用户 MODE=full、AUTO_DISCONNECT=True 均保留。远端 HEAD 与本地源码提交一致 `329e1ea`；本次 notebook 清理尚为本地更改。无收费 API、无正式训练，未实际执行 Colab 全量流程 | `outputs/final_00_review/checks.json`；`outputs/final_00_review/00_before_retiring_repairs.ipynb` |
 | 公开配套题内重新划分与旧数据迁移 | 用户选定每库 300 test / 100 validation / 100 heldout（HotpotQA、MuSiQue），2Wiki 500 test。实际公开问题文件按固定种子划分：HotpotQA 支持完整数 validation 99/100、heldout 100/100、test 297/300；MuSiQue 100/100、100/100、300/300；2Wiki 498/500。覆盖审计在与完整训练源合并前执行；Colab 最终清单另行核查。真实小样本旧派生文件归档、旧完成标记移除、图与缓存保留通过。完整回归 **67 passed**（92.13s）；其后新增缓存幂等测试另见下一项 | `outputs/public_coverage_audit/v2_split_support.json`；`outputs/split_v2_si1ah8ew/verification.json` |

@@ -5,6 +5,8 @@ import asyncio
 import hashlib
 import os
 from pathlib import Path
+import shutil
+import tempfile
 import time
 from uuid import uuid4
 
@@ -84,6 +86,69 @@ def ensure_bge_weights(cache_folder=None):
     return ensure_embedding_weights(BGE_MODEL, BGE_REVISION, cache_folder)
 
 
+def stage_embedding_snapshot(model, revision, weight_path, cache_folder=None):
+    """Load the verified encoder from regular local files, not Drive-backed mmap.
+
+    Only these two pinned encoder layouts are supported. Persistent HF downloads
+    stay in the original cache; the runtime copy is disposable and never changes
+    the model identity used to bind graphs/candidate pools.
+    """
+    from huggingface_hub import hf_hub_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
+    from safetensors import safe_open
+
+    specs = {(BGE_MODEL, BGE_REVISION): (BGE_WEIGHT_BYTES, BGE_WEIGHT_SHA256),
+             (MINILM_MODEL, MINILM_REVISION): (MINILM_WEIGHT_BYTES, MINILM_WEIGHT_SHA256)}
+    size, checksum = specs[(model, revision)]
+    local = Path(tempfile.gettempdir()) / "sajev_embedding_models" / digest([model, revision])[:24]
+    local.mkdir(parents=True, exist_ok=True)
+
+    def weight_ok(path):
+        if path.is_symlink() or not path.is_file() or path.stat().st_size != size:
+            return False
+        with path.open("rb") as stream:
+            return hashlib.file_digest(stream, "sha256").hexdigest() == checksum
+
+    def copy_regular(source, target):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp-" + uuid4().hex)
+        try:
+            # Stream bytes through Python IO, avoiding FUSE mmap/copy-file shortcuts
+            # and materializing symlinks rather than copying the link itself.
+            with Path(source).open("rb") as src, temporary.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    target = local / "model.safetensors"
+    if not weight_ok(target):
+        print(f"Copying verified embedding weight to local runtime: {target}", flush=True)
+        copy_regular(weight_path, target)
+    if not weight_ok(target):
+        raise RuntimeError(f"Local embedding copy failed checksum validation: {target}. "
+                           "The source may have changed during copying; graph/pool files were not modified.")
+    # Check the same local file the transformer will open, including mmap parsing.
+    with safe_open(str(target), framework="pt", device="cpu") as tensors:
+        if not tensors.keys():
+            raise ValueError(f"Embedding weight contains no tensors: {target}")
+
+    # Both pinned models use a root Transformer and 1_Pooling; Normalize needs no
+    # file. Explicit files avoid downloading duplicate PyTorch/ONNX/OpenVINO weights.
+    metadata = ("config.json", "config_sentence_transformers.json", "modules.json",
+                "sentence_bert_config.json", "special_tokens_map.json", "tokenizer.json",
+                "tokenizer_config.json", "vocab.txt", "1_Pooling/config.json")
+    for filename in metadata:
+        args = dict(repo_id=model, filename=filename, revision=revision, cache_dir=cache_folder)
+        try:
+            source = hf_hub_download(**args, local_files_only=True)
+        except LocalEntryNotFoundError:
+            source = hf_hub_download(**args)
+        copy_regular(source, local / filename)
+    print(f"Local embedding snapshot verified; loading ONLY from {local}", flush=True)
+    return local
+
+
 async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
                               revision=BGE_REVISION, device="auto", batch_size=16,
                               max_length=512, query_prefix=BGE_QUERY_PREFIX):
@@ -117,13 +182,20 @@ async def make_embedding_func(*, backend="local", model=BGE_MODEL, dim=384,
         cache = str(Path(os.environ["HF_HOME"]) / "hub")
     print(f"Loading local embedding: {model}@{revision}, device={actual_device}", flush=True)
     started = time.perf_counter()
+    weight_path = None
     if model == BGE_MODEL and revision == BGE_REVISION:
-        await asyncio.to_thread(ensure_bge_weights, cache)
+        weight_path = await asyncio.to_thread(ensure_bge_weights, cache)
     elif model == MINILM_MODEL and revision == MINILM_REVISION:
-        await asyncio.to_thread(ensure_embedding_weights, model, revision, cache)
+        weight_path = await asyncio.to_thread(ensure_embedding_weights, model, revision, cache)
+    load_path = model
+    load_options = {"revision": revision, "cache_folder": cache}
+    if weight_path is not None:
+        local = await asyncio.to_thread(stage_embedding_snapshot, model, revision, weight_path, cache)
+        load_path = str(local)
+        load_options = {"local_files_only": True}
     encoder = await asyncio.to_thread(
-        SentenceTransformer, model, revision=revision, device=actual_device,
-        cache_folder=cache, trust_remote_code=False, model_kwargs={"use_safetensors": True},
+        SentenceTransformer, load_path, device=actual_device, **load_options,
+        trust_remote_code=False, model_kwargs={"use_safetensors": True},
     )
     if encoder.get_embedding_dimension() != dim:
         raise ValueError(f"embedding_dim={dim} does not match encoder dimension "
