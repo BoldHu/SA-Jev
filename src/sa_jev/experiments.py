@@ -129,6 +129,11 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
     if variant == "dpo": cfg.stability_weight = 0.
     if variant == "stability": cfg.dpo_weight = 0.
     if variant.startswith("stab_weight_"): cfg.stability_weight = float(variant.removeprefix("stab_weight_"))
+    context_bank = None
+    if stage == 2 and cfg.context_view_mode == "reviewed_context":
+        from .context_views import ReviewedContexts
+        context_bank = ReviewedContexts(data/f"training_contexts{suffix}.json", train,
+                                        require_complete=max_steps is None)
     output = root/f"runs/{variant}/seed_{seed}"
     environment_manifest(output/"environment.json", config)
     import random
@@ -141,7 +146,8 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
         if cfg.dpo_weight:
             pairs = [PreferencePair.from_dict(x) for x in read_jsonl(data/f"preferences{suffix}.jsonl")]
             reference = cache_reference(model, pairs, root/f"reference/seed_{seed}{suffix}.json")
-    history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume)
+    history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume,
+                  context_bank=context_bank)
     training_report(history, output)
     del model; gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()

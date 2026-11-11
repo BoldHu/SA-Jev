@@ -8,7 +8,7 @@ import os
 import re
 import time
 from urllib.parse import urlsplit, urlunsplit
-from .io import digest, read_json, write_json
+from .io import digest, read_json, write_json, progress_rows
 from .schema import Evidence, Pool, deduplicate
 from .embeddings import BGE_MODEL, BGE_REVISION, BGE_QUERY_PREFIX, make_embedding_func
 
@@ -265,13 +265,12 @@ def hard_candidates(questions, corpus, k=64, dense=False, embedding_model="sente
     """Training-only mining. No negative label is inferred merely from retrieval."""
     from rank_bm25 import BM25Okapi
     import numpy as np
-    from tqdm.auto import tqdm
     started = time.perf_counter()
     print("[tasks] Deduplicating training corpus for candidate mining...", flush=True)
     corpus = deduplicate(corpus)
     print(f"[tasks] Mining corpus: {len(corpus):,} unique documents; dense={dense}; no LLM API calls", flush=True)
     tokenize = lambda s: re.findall(r"\w+", s.lower())
-    tokens = [tokenize(e.title + " " + e.text) for e in tqdm(corpus, desc="BM25 tokenize", unit="doc", mininterval=5)]
+    tokens = [tokenize(e.title + " " + e.text) for e in progress_rows(corpus, "BM25 tokenize")]
     print("[tasks] Building BM25 statistics (CPU); waiting for index construction...", flush=True)
     bm25 = BM25Okapi(tokens)
     del tokens
@@ -283,7 +282,7 @@ def hard_candidates(questions, corpus, k=64, dense=False, embedding_model="sente
         encoder = SentenceTransformer(embedding_model)
         vectors = encoder.encode([e.title + " " + e.text for e in corpus], normalize_embeddings=True)
     result = {}
-    for q in tqdm(questions, desc="Mine training candidates", unit="question", mininterval=5):
+    for q in progress_rows(questions, "Mine training candidates"):
         lexical = np.argsort(-bm25.get_scores(tokenize(q.question)))[:k]
         indices = list(lexical)
         if dense:

@@ -3,10 +3,34 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from contextlib import contextmanager
 from tempfile import NamedTemporaryFile
 from pathlib import Path
 from dataclasses import asdict, is_dataclass
+
+
+def progress_rows(rows, label, *, total=None):
+    """Plain flushed stdout, including in notebooks without working widgets.
+
+    Reports completed items after the caller processes them. A slow individual
+    item can delay the next line; this is progress reporting, not a heartbeat.
+    """
+    if total is None and hasattr(rows, "__len__"):
+        total = len(rows)
+    started = last = time.perf_counter()
+    count = 0
+    target = f"/{total:,}" if total is not None else ""
+    print(f"[data] {label}: starting 0{target}; waiting for records...", flush=True)
+    for count, row in enumerate(rows, 1):
+        yield row
+        now = time.perf_counter()
+        if count == 1 or now - last >= 5:
+            rate = count / max(now - started, 1e-9)
+            eta = f"{max(0, total-count)/rate:.0f}s" if total is not None else "unknown (streaming)"
+            print(f"[data] {label}: {count:,}{target} records, {rate:.1f}/s, ETA={eta}", flush=True)
+            last = now
+    print(f"[data] {label}: finished {count:,} records in {time.perf_counter()-started:.1f}s", flush=True)
 
 
 def canonical(value):

@@ -37,6 +37,7 @@ data:
   validation_per_dataset: 100
   heldout_per_dataset: 100
 training:
+  context_view_mode: reviewed_context
   epochs: 1
   accumulation: 8
   learning_rate: 2.0e-05
@@ -51,6 +52,13 @@ training:
   validate_every: 100
   save_every: 100
   memory_limit_gib: 79.0
+context_views:
+  min_words: 24
+  max_words: 384
+  max_candidates: 2
+  review_max_tokens: 2048
+  disable_thinking: true
+  # review_model omitted: reuse evaluation.answer_model and the existing .env relay.
 evaluation:
   efficiency_max_decision_tokens: 262144
   threshold: 0.5

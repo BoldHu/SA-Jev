@@ -33,6 +33,7 @@ class TrainConfig:
     validate_every: int = 100
     save_every: int = 100
     memory_limit_gib: float = 79.
+    context_view_mode: str = "serialization"  # Legacy/control; experiment YAML uses reviewed_context.
 
 
 def memory_stats(device):
@@ -99,7 +100,8 @@ def validate(model, examples):
     return {"validation": means, "validation_valid_counts": counts}
 
 
-def fit(model, train, validation, config: TrainConfig, output, pairs=(), reference=None, resume=None):
+def fit(model, train, validation, config: TrainConfig, output, pairs=(), reference=None, resume=None,
+        context_bank=None):
     if config.stage not in (1, 2) or not train or config.accumulation < 1:
         raise ValueError("invalid training configuration or empty data")
     if any(x.split != "train" for x in train): raise ValueError("training input contains held-out data")
@@ -110,12 +112,18 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
         raise ValueError("DPO requires real trajectory pairs and frozen Stage-1 reference cache")
     if use_dpo and any(p.fingerprint not in reference["values"] for p in pairs):
         raise ValueError("reference cache does not cover all pairs")
+    if config.context_view_mode not in {"serialization", "reviewed_context"}:
+        raise ValueError("unknown context view mode")
+    reviewed = config.stage == 2 and config.context_view_mode == "reviewed_context"
+    if reviewed and context_bank is None:
+        raise ValueError("Stage 2 requires a reviewed context bank; run prepare_context_views first")
     random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     if (output / "latest.json").exists() and resume is None:
         raise FileExistsError("run already has a checkpoint; use resume or a different output directory")
     write_json(output / "config.json", asdict(config))
-    binding = digest({"states": train, "validation": validation, "pairs": pairs, "config": asdict(config)})
+    binding = digest({"states": train, "validation": validation, "pairs": pairs, "config": asdict(config),
+                      "context_bank": context_bank.binding if reviewed else None})
     groups = []
     for head in (False, True):
         parameters = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("core.head") == head]
@@ -156,27 +164,45 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
         counts = {"rank": sum(x.labels.rank_valid for x in batch),
                   "suf": sum(x.labels.suf_valid for x in batch),
                   "rel": sum(sum(x.labels.rel_valid) for x in batch)}
-        stab_counts = {"rank": sum(x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient and bool(x.labels.candidate_ids) for x in batch),
-                       "suf": sum(x.labels.suf_valid and x.labels.gold_available for x in batch)}
+        secondary = []
+        over_budget = 0
+        for x in batch:
+            view = None
+            if config.stage == 2:
+                view = context_bank.view(x, random) if reviewed else View(random.choice((1, 2)))
+                if reviewed and view is not None and not model.view_within_budget(x.state, view):
+                    view = None; over_budget += 1
+            secondary.append(view)
+        stab_counts = {
+            "rank": sum(v is not None and x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient
+                        and bool(x.labels.candidate_ids) for x, v in zip(batch, secondary)),
+            "suf": sum(v is not None and x.labels.suf_valid and x.labels.gold_available for x, v in zip(batch, secondary))}
         optimizer.zero_grad(set_to_none=True)
         log = {"step": step + 1, "epoch": epoch, "rank": 0., "suf": 0., "rel": 0., "dpo": 0., "stability": 0.}
+        log.update(paired_states=sum(v is not None for v in secondary),
+                   context_pairs=sum(bool(v and v.context_suffix) for v in secondary),
+                   context_over_budget=over_budget, unpaired_states=sum(v is None for v in secondary),
+                   valid_stab_rank=stab_counts["rank"], valid_stab_suf=stab_counts["suf"])
         warmup = min(1., (step + 1) / max(1, config.stability_warmup_steps))
-        for x in batch:
+        for x, second_view in zip(batch, secondary):
             pa = model(x.state, View(0))
             views = [pa]
-            if config.stage == 2:
-                views.append(model(x.state, View(random.choice((1, 2)))))
+            if second_view is not None:
+                views.append(model(x.state, second_view))
             loss = pa.log_h.sum() * 0.
             for p in views:
                 c, n = task_loss([p], [x.labels])
                 for key, weight in (("rank", 1.), ("suf", 1.), ("rel", .2)):
                     value = c[key] * n[key] / max(1, counts[key]) / len(views)
                     loss = loss + weight * value; log[key] += float(value.detach())
-            if config.stage == 2 and config.stability_weight > 0:
+            if config.stage == 2 and config.stability_weight > 0 and second_view is not None:
                 # Compute the two masked means separately to preserve their distinct denominators.
                 pb = views[1]
+                if set(pa.candidate_ids) != set(pb.candidate_ids):
+                    raise ValueError("context view changed the effective candidate set")
                 if x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient and pa.candidate_ids:
-                    value = torch.relu(torch.linalg.vector_norm(pa.p - pb.p) - config.tolerance).square() / max(1, stab_counts["rank"])
+                    aligned = [pb.candidate_ids.index(eid) for eid in pa.candidate_ids]
+                    value = torch.relu(torch.linalg.vector_norm(pa.p - pb.p[aligned]) - config.tolerance).square() / max(1, stab_counts["rank"])
                     loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
                 if x.labels.suf_valid and x.labels.gold_available:
                     value = torch.relu(torch.abs(pa.h - pb.h) - config.tolerance).square() / max(1, stab_counts["suf"])

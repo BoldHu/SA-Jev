@@ -7,7 +7,7 @@ import itertools
 import json
 import time
 import urllib.request
-from .io import digest, read_json, read_jsonl, write_json, write_jsonl
+from .io import digest, read_json, read_jsonl, write_json, write_jsonl, progress_rows as _progress_rows
 from .schema import Question, TaskExample, Evidence, Pool, deduplicate
 from .data import hotpot, musique, twowiki, split_questions, audit_splits, sample_training, build_training_states, task_states
 from .trajectories import build_preferences
@@ -17,22 +17,6 @@ from .retrieval import PoolCache, hard_candidates
 def load_raw(path):
     path = Path(path)
     return read_jsonl(path) if path.suffix == ".jsonl" else iter(read_json(path))
-
-
-def _progress_rows(rows, label, *, total=None):
-    """Report real streaming progress; an unknown source length has no ETA."""
-    started = last = time.perf_counter()
-    count = 0
-    print(f"[data] {label}: starting; waiting for records...", flush=True)
-    for count, row in enumerate(rows, 1):
-        yield row
-        now = time.perf_counter()
-        if count == 1 or now - last >= 5:
-            rate = count / max(now - started, 1e-9)
-            eta = f"{max(0, total-count)/rate:.0f}s" if total else "unknown (streaming)"
-            print(f"[data] {label}: {count:,} records, {rate:.1f}/s, ETA={eta}", flush=True)
-            last = now
-    print(f"[data] {label}: finished {count:,} records in {time.perf_counter()-started:.1f}s", flush=True)
 
 
 def _copy_with_progress(source, dest, label, *, total=None):

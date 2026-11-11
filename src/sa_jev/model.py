@@ -38,6 +38,19 @@ class SAJev(nn.Module):
     @property
     def device(self): return next(self.parameters()).device
 
+    def view_within_budget(self, state, view):
+        """Check the complete augmented decisions without truncating any evidence."""
+        from openjev.api.typesafe import parse_request
+        choice, suf, _ = requests(state, view, include_rel=False)
+        for body in (suf, choice):
+            if body is None: continue
+            try:
+                self.serializer(parse_request(body, model_ids=set())[0].decision)
+            except ValueError as exc:
+                if "no automatic truncation" in str(exc): return False
+                raise
+        return True
+
     def decision(self, body):
         from openjev.api.typesafe import parse_request
         from openjev.data.collator import collate_serialized

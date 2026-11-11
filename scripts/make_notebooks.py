@@ -140,9 +140,11 @@ create('02_stage1.ipynb', '# Stage 1 · 任务学习\n复用已训练 OpenJev-4B
 ('code', "from sa_jev.experiments import train_variant\nseeds = [17] if MODE=='pilot' else config['seeds']\nfor seed in seeds:\n    train_variant(ROOT, config, 'stage1', seed, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)"),
 ('md', '检查 training.csv/PNG/PDF、验证 loss、实际显存和 ETA。4GB 本地 tiny 测试不能代替 4B A100 测试；OOM 时降低 branch_microbatch，不切分 softmax，不截断证据，不改变标签。恢复训练使用 train_variant(..., resume=checkpoint_path)。')])
 
-create('03_stage2.ipynb', '# Stage 2 · 整轨迹 DPO + 等义双视图\nL_task(two views) + 0.2 DPO + 0.1 stability；β=0.1，容忍区间 0.05。预算耗尽不算自主 STOP。', [
+create('03_stage2.ipynb', '# Stage 2 · 整轨迹 DPO + 核验上下文双视图\n干净状态 vs 追加主题相关但不提供支持的 context。L_task(two views) + 0.2 DPO + 0.1 stability；β=0.1，容忍区间 0.05。预算耗尽不算自主 STOP。', [
+('md', '先执行下面的上下文准备格：读取 00 已保存的任务状态，从训练语料选段落并用 .env 中的 API 审核，结果逐条缓存到 Drive；不重做检索、候选挖掘或 DPO 轨迹。默认每题最多审核 2 段，接受 1 段，长度 24–384 词；12,000 题首次最多 24,000 次审核请求，实际数量取决于过滤与提前接受。复跑复用缓存。可以先在 CPU 运行此格；训练格才需要 A100。API 审核不等于人工核验或语义保证，论文必须报告审核方式、通过率和人工抽查；独立测试包不得用于这里。'),
+('code', "from sa_jev.context_views import prepare_context_views\ncontext_summary = prepare_context_views(ROOT, config)\ncontext_summary"),
 ('code', "from sa_jev.experiments import train_variant\nfor seed in ([17] if MODE=='pilot' else config['seeds']):\n    train_variant(ROOT, config, 'full', seed, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)"),
-('md', '参考缓存与冻结 Stage 1 权重、完整轨迹和输入视图绑定。双视图仅改变呈现，不使用 8,000 对人工无关样本；真实相邻证据状态继续分别计算任务损失。')])
+('md', '冻结参考和 DPO 均保留干净轨迹，旧 preferences.jsonl 可复用。两视图使用相同标签，只有普通 context 字段追加已审核文本，不显示“无关”标记或审核信息。无合格段落、未知标签或追加后超出 token 上限的状态只做干净任务训练；不截断证据，不把真实状态变化当作不变对。training.jsonl 记录 context_pairs、unpaired_states、context_over_budget 和各稳定性有效数。旧序列化控制可设 config[\'training\'][\'context_view_mode\']=\'serialization\'，须使用独立实验目录，不能混合续训。')])
 
 create('04_main_comparison.ipynb', '# 主性能 · 共享召回池与回答模型\nHotpotQA / MuSiQue / 2Wiki 跨数据集；保存逐题原始轨迹和配对统计。', [
 ('code', "from sa_jev.experiments import main_experiment\nrows = main_experiment(ROOT, config, seeds=[17] if MODE=='pilot' else config['seeds'], limit=8 if MODE=='pilot' else None)"),
@@ -153,7 +155,7 @@ create('05_robustness_response.ipynb', '# 独立干扰与有效变化\n约 600 �
 ('md', '同时检查 JS、Top-1/Top-5、充分性翻转、错误提前停止、nDCG 和有效变化后正确补证。新增已选证据会改变剩余候选集合，不强行比较为不变分布。')])
 
 create('06_ablations.ipynb', '# 消融\nStage 1；DPO；稳定性；完整模型；无状态更新；小 K；少量稳定性权重。', [
-('code', "from sa_jev.experiments import train_variant, main_experiment\nfrom sa_jev.preparation import prepare_tasks\nprepare_tasks(ROOT/'data', counts=config['data']['train_counts'], mine=True, small_k=True)\nfor seed in ([17] if MODE=='pilot' else config['seeds']):\n    for variant in ['dpo','stability','small_stage1','small_k']:\n        train_variant(ROOT, config, variant, seed, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)\nmain_experiment(ROOT, config, table_name='ablations', methods=['openjev_frozen','stage1','dpo','stability','full','no_state_update','small_k'], seeds=[17] if MODE=='pilot' else config['seeds'], limit=8 if MODE=='pilot' else None)"),
+('code', "from sa_jev.experiments import train_variant, main_experiment\nfrom sa_jev.preparation import prepare_tasks\nfrom sa_jev.context_views import prepare_context_views\nprepare_tasks(ROOT/'data', counts=config['data']['train_counts'], mine=True, small_k=True)\nprepare_context_views(ROOT, config)  # Reuses the normal-K bank prepared in 03.\nprepare_context_views(ROOT, config, small_k=True)  # Different pools/states require separate reviews.\nfor seed in ([17] if MODE=='pilot' else config['seeds']):\n    for variant in ['dpo','stability','small_stage1','small_k']:\n        train_variant(ROOT, config, variant, seed, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)\nmain_experiment(ROOT, config, table_name='ablations', methods=['openjev_frozen','stage1','dpo','stability','full','no_state_update','small_k'], seeds=[17] if MODE=='pilot' else config['seeds'], limit=8 if MODE=='pilot' else None)"),
 ('md', '权重选择只用 validation task loss/验证指标，不查看独立扰动测试来选权重。以下小扫掠先保留单种子。'),
 ('code', "for weight in [0.05,0.2]:\n    train_variant(ROOT, config, f'stab_weight_{weight}', 17, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)")])
 

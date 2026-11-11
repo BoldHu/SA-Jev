@@ -262,7 +262,7 @@ L_{rank}=-0.5\log(0.2)-0.5\log(0.5)\approx1.1513.
 
 ### 6.4 稳定性与有效变化如何分开
 
-把 S1 的 JSON 改为缩进格式，或调整状态字段呈现顺序，语义仍是 S1，两个视图应该输出接近的 `p` 与 `h`。
+当前主实验向 S1 的普通 `context` 追加经审核的无关背景，保留原任务标签，约束两视图的 `p` 与 `h` 接近。仅修改 JSON 格式作为旧控制模式仍可运行。
 
 但 S1 读入 B 变为 S2 后，预算和已选证据都变了，充分性应从 0 变为 1。**不能对 S1 和 S2 施加分布相同的稳定性损失。** 这一步由各自任务标签监督。
 
@@ -335,9 +335,19 @@ L_{DPO}=-\log\sigma(\beta\Delta_\theta),\qquad\beta=0.1.
 
 ### 7.4 等义双视图和带容忍区间的约束
 
-当前 `View(0/1/2)` 只改变序列化：紧凑 JSON、缩进 JSON、反向字段呈现。保留问题、有效条件、已选证据、候选内容与 ID、预算及标签。它不生成新的自然语言事实，也不新增 8,000 对人工无关训练样本。
+当前主配置为 `training.context_view_mode: reviewed_context`：视图 a 保留原状态，视图 b 在普通 `context` 末尾追加一段经 API 审核的训练原文，两个视图格式相同。问题、有效条件、已选证据、候选内容与 ID、预算及标签保持不变。旧 `serialization` 模式仅保留为单独控制，不与新模式的检查点混合续训。
 
-每个合法状态生成两个视图 a、b，两者都计算任务损失，取平均：
+03 notebook 的训练前准备格调用 `prepare_context_views(ROOT, config)`，读取 00 的 `questions.jsonl` 和 `train_states.jsonl`；优先原始干扰段，再按问题中最多四个较稀有主题词，从已采样训练问题的段落中各抽至多 32 个备选，按词重合排序。该查找仅为上下文增强，不改变 C0。候选正文必须在当前全部 C0 之外，不能与其包含或被包含，以免在充分性输入中暴露未选证据。排除非训练题原文、金标支持、显式答案/支持文本、未知 Gold、非空有效条件等情况。结构过滤只能提出审核候选，不能自动证明无关。
+
+API 审核器看到问题、答案及支持标注、原始状态和提议段落，逐项审核主题相关性、无新增支持、无答案泄漏、无矛盾、无有效条件变化、无指令、所有状态标签保持有效。必须全部明确通过且置信标为 high；低置信或任一不通过均拒绝；截断或格式不完整则中止批处理以避免持续浪费请求。审核身份、理由、实际响应模型、token 用量和来源保存在 `data/context_reviews/`；这些 Gold 与审核信息不会进入 SA-Jev 输入。模型审核仍可能出错，不能称为人工验证或语义等价证明，正式论文应人工抽查并报告审核误差。
+
+默认 `context_views.min_words=24`、`max_words=384`、`max_candidates=2`，每题接受至多一段完整原文，不拼接未经联合核验的多个段落。12,000 题首次最多 24,000 次逻辑审核请求（HTTP 重试另计），有合格段落即可提前结束。模型默认沿用 `evaluation.answer_model`，可用 `context_views.review_model` 覆盖，服务地址/密钥仍来自 `.env`。`review_max_tokens=2048`；DeepSeek 默认设置 `disable_thinking=true`，避免输出预算全部被推理占用。该参数依据 [DeepSeek 官方文档](https://api-docs.deepseek.com/guides/thinking_mode/)，中转站是否实际执行仍须小样本核实。每条审核即时缓存；断线重跑复用已完成记录，完整 bank 再次运行不调用 API。
+
+汇总保存在 `data/training_contexts.json`，按具体训练状态、标签及来源绑定，训练时在线组成第二视图。不改写 `train_states.jsonl`、`preferences.jsonl` 或固定候选池；DPO 和冻结 Stage 1 参考仍重放干净轨迹。06 的小 K 状态用独立 `training_contexts_small_k.json`，因为候选池发生变化，需要重新审查。普通 K 的各消融与种子共享同一审核 bank。
+
+没有合格段落、标签不可用或追加后超出原有 token 限制的状态只计算干净任务损失；不强制不变，也不截断正文以腾空间。训练日志记录 `context_pairs`、`unpaired_states`、`context_over_budget` 和两项稳定性有效数。必须报告实际增强覆盖率，不能把 12,000 题都称为已核验增强题。此数据不等于独立扰动测试集，05 的保留题和测试材料不参与训练审核或调参。
+
+对具有合格增强视图的合法状态生成 a、b，两者都计算原任务损失，取平均；其余状态保持单视图任务损失：
 
 \[
 L_{task}^{two\ views}=\tfrac12(L_{task}^{a}+L_{task}^{b}).
@@ -360,7 +370,7 @@ L_{stab}=L_{stab,rank}+L_{stab,suf}.
 
 例如两视图的概率 L2 距离为 0.08、充分性差为 0.09，则该对的稳定性惩罚为 `0.03²+0.04²=0.0025`；差均不超过 0.05 时为零。零 loss 只能说明此对落入容忍区间，不能证明面对复杂干扰已经鲁棒。
 
-一致性正则不是新概念，例如 [R-Drop](https://arxiv.org/abs/2106.14448) 用不同 dropout 输出间的分布约束。本项目具体采用输入等价呈现、L2/概率差、容忍阈值和任务合法性掩码，不应称为原样复现 R-Drop。
+一致性正则不是新概念，例如 [R-Drop](https://arxiv.org/abs/2106.14448) 用不同 dropout 输出间的分布约束。本项目具体采用经审核的无关上下文增强、L2/概率差、容忍阈值和任务合法性掩码，不应称为原样复现 R-Drop。
 
 ### 7.5 Stage 2 总目标
 
@@ -405,7 +415,7 @@ L_{stab}=L_{stab,rank}+L_{stab,suf}.
 | 轨迹偏好 | 最多约 3,000 对 | 从训练题派生，丢弃不明确偏好 |
 | 验证状态 | 每题最多 3 个，最多约 600 | 来源为真实召回池，不能补入金标 |
 | 独立扰动包 | 目标上限 600 个状态包 | 来自 200 保留题，每包 3 无关扰动＋1 有效变化，需人工审核 |
-| 在线训练双视图 | 每个 Stage 2 任务状态两个视图 | 不新增独立 QA 样本，不计成 72,000 个独立问题 |
+| 在线训练双视图 | 审核通过且未超输入预算的 Stage 2 状态有两个视图，其余保留干净任务训练 | 不新增独立 QA 样本；报告实际增强覆盖率，不计成 72,000 个独立问题 |
 
 保留题数量乘 3 只是理论上界。已经充分、找不到有效新增支持、干扰提案不足等情况会减少可用状态包。文档和论文必须报告实际核验包数、独立问题数、有效标签数。
 
@@ -733,7 +743,7 @@ AUROC 当前先在单题的短轨迹内计算，再进行汇总，很多题只�
 
 ### 14.1 消融的实际控制变量
 
-`dpo` 与 `stability` 都从 Stage 1 初始化。当前 Stage 2 即使关闭稳定性项，仍使用两视图的任务平均损失。因此 `stage1` 对 `dpo` 的差异还包括继续训练与双视图任务；要隔离稳定性正则本身，应重点比较 `dpo` 与 `full`，保持其他计算设置一致。
+`dpo` 与 `stability` 都从 Stage 1 初始化。当前 Stage 2 即使关闭稳定性项，对审核通过的状态仍使用两视图任务平均损失；没有合格视图的状态只做干净任务训练。因此 `stage1` 对 `dpo` 的差异还包括继续训练与上下文增强；要隔离稳定性正则本身，应重点比较 `dpo` 与 `full`，共享审核缓存并保持其他计算设置一致。
 
 `no_state_update` 只从 Choice 输入移除已选证据内容，当前剩余候选、预算以及独立充分性仍遵循真实状态。它不能被描述成“模型完全不知道状态”。
 
@@ -760,7 +770,7 @@ AUROC 当前先在单题的短轨迹内计算，再进行汇总，很多题只�
 | [00_environment_data](../notebooks/00_environment_data.ipynb) | 环境、tiny smoke、MiniLM、公开图导入、原始数据、候选缓存、任务标签、偏好、重叠审计、扰动草稿 | Git、HF/数据下载、关键词 API | `raw/`、`index/`、`data/`、manifest、完成标记；不训练 4B |
 | [01_original_diagnostics](../notebooks/01_original_diagnostics.ipynb) | 原模型重复调用、K 扩展；有已核验包时测无关扰动 | 00；首次需下载 4B；官方 Jev 可选 | diagnostics、efficiency、original_perturbations；不能把缺失扰动评测当作完成 |
 | [02_stage1](../notebooks/02_stage1.ipynb) | 真正的 4B 任务微调 | 00 的训练/验证状态与完整重叠审计 | `runs/stage1/seed_*/`、loss、显存、ETA、checkpoint |
-| [03_stage2](../notebooks/03_stage2.ipynb) | 冻结参考缓存、完整轨迹 DPO、双视图任务与稳定性 | 同 ROOT、同 seed 的 Stage 1 | `reference/`、`runs/full/seed_*/` |
+| [03_stage2](../notebooks/03_stage2.ipynb) | 训练上下文 API 审核缓存、冻结参考、干净轨迹 DPO、上下文双视图任务与稳定性 | 00 的原任务状态、同 ROOT/seed 的 Stage 1；审核用原 `.env` | `data/context_reviews/`、`data/training_contexts.json`、`reference/`、`runs/full/seed_*/` |
 | [04_main_comparison](../notebooks/04_main_comparison.ipynb) | 主测试共享池对照及回答 | 00/02/03，回答 API；官方 Jev 可选 | 原始轨迹、逐题 CSV、汇总图、配对 bootstrap |
 | [05_robustness_response](../notebooks/05_robustness_response.ipynb) | 独立无关扰动与有效变化响应 | 人工审核后的测试包，02/03 | `results/robustness/`；当前默认只运行 seed 17 |
 | [06_ablations](../notebooks/06_ablations.ipynb) | DPO/稳定性/小 K 训练、无状态更新评测、额外权重训练 | 00/02/03；额外生成 small-K 数据 | 消融 checkpoints 与表格；0.05/0.2 模型还需另加评价调用 |
@@ -780,7 +790,7 @@ AUROC 当前先在单题的短轨迹内计算，再进行汇总，很多题只�
 9. 扫描公开 OpenJevData 重叠，生成独立扰动草稿。
 10. 检查产物清单，写入 `00_complete.json`；若开启自动断开，在成功且 Drive 刷新后释放 Colab 运行时。
 
-00 保存了主实验所需的大部分数据准备产物，但没有完成人工扰动审核、small-K 消融的额外派生数据、工业 OCR 图或任何正式训练。因此“以后所有实验都不再加工数据”不准确；更准确的是“不必反复下载主数据或重建三套公开图，也不必为每个模型重复召回”。
+00 保存了主实验所需的大部分数据准备产物，但没有完成 03 的训练上下文 API 审核、人工测试扰动审核、small-K 消融的额外派生数据、工业 OCR 图或任何正式训练。因此“以后所有实验都不再加工数据”不准确；更准确的是“不必反复下载主数据或重建三套公开图，也不必为每个模型重复召回”。
 
 ### 15.2 当前默认子集和步数
 
@@ -813,6 +823,8 @@ MyDrive/SA-Jev/
         train_states.jsonl
         validation_states.jsonl
         preferences.jsonl
+        training_contexts.json       03 保存的训练上下文审核汇总
+        context_reviews/             逐请求缓存，可断线续跑
         perturbations_draft.jsonl
         perturbations_reviewed.jsonl  人工审核后才存在
         各类 manifest 与覆盖审计
@@ -837,6 +849,7 @@ MyDrive/SA-Jev/
 | 00 环境与主数据准备 | CPU 可用；full 优先高内存运行时，服务器可先规划 32–64 GB RAM | MiniLM 能在 CPU 编码；全量 JSON、训练语料和 BM25 占系统内存。该 RAM 范围为规划建议，未测 full 峰值 |
 | 01 原模型本地诊断 | 单张能运行 BF16 4B 的 NVIDIA GPU；为长 K 保持可比性可用 A100 80GB | 不训练但仍有大量分支推理；官方 Jev 调用本身不需要本地 GPU |
 | 02/03 正式训练 | 单张 A100 80GB，足够系统 RAM 与持久磁盘 | 方法约束；真实峰值须先在目标硬件测量，尚未完成正式验证 |
+| 03 上下文审核准备格 | CPU、高内存运行时即可，可在租用训练 GPU 前完成 | 读现有状态，API 审核训练段落，完成后保存在 Drive，训练时离线读取 |
 | 04/05 推理评测 | 优先复用 A100 80GB 实验环境 | 同底座、长候选，避免不同硬件/精度混淆成本；更小卡能否运行须实测 |
 | 06 消融 | 与主训练相同 A100 80GB | 是多次训练，往往比单跑 03 更耗总时间 |
 | 07 K 外推 | 优先 A100 80GB | 128/256 候选可能触发 token 上限或 OOM，应报告失败，不静默缩 K |
@@ -952,7 +965,8 @@ Stage 2 时间约 = 冻结参考缓存时间 + 实测 Stage 2 每步秒数 × �
 | 00 的真实混合查询 | 可能需要查询关键词生成 | LightRAG 查询缓存与固定候选池 |
 | 支持标签、状态、偏好构造 | 否 | JSONL 与 manifest |
 | Stage 1/Stage 2 训练 | 不调用中转站；使用本地 GPU | LoRA/head checkpoint 和优化器状态 |
-| 在线等价视图 | 否，确定性格式变换 | 随训练即时生成 |
+| 03 训练上下文核验 | 是，段落来自训练原文，API 只负责审核 | 逐条审核缓存与 training_contexts.json；首次至多每题两条审核，HTTP 重试另计 |
+| 训练时组成双视图 | 否，使用已审核段落追加普通 context | 随训练即时组成；审核不通过/未知/超长时单视图任务训练 |
 | 官方 Jev 基线 | 是，独立 TypeSafe 服务 | 实际预测、模型身份、usage |
 | 主测试最终答案 | 是，统一回答模型 | 按输入与配置绑定的答案缓存 |
 | 工业图构建及查询 | 是，08 单独处理 | 工业索引和查询缓存 |

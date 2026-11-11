@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import random
 import torch
-from .io import digest
+from .io import digest, progress_rows
 from .schema import State, labels_for
 from .prompts import View
 
@@ -119,12 +119,11 @@ def preference(q, a, b):
 
 
 def build_preferences(questions, initial_states, limit=3000, seed=17):
-    from tqdm.auto import tqdm
     lookup = {q.id: q for q in questions}
     rng = random.Random(seed)
     states = list(initial_states); rng.shuffle(states)
     result, seen = [], set()
-    for state in tqdm(states, desc="Build trajectory preferences", unit="question", mininterval=5):
+    for state in progress_rows(states, "Build trajectory preferences"):
         q = lookup[state.question_id]
         if q.split != "train": raise ValueError("preference data is training-only")
         candidates = [_rollout(q, state, mode, rng) for mode in ("greedy", "redundant", "early", "random")]

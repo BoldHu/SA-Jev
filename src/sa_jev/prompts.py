@@ -9,13 +9,15 @@ from .schema import State, Evidence
 @dataclass(frozen=True)
 class View:
     style: int = 0
+    context_suffix: str = ""  # Only supplied by the reviewed training-context bank.
 
 
 def render_state(state: State, view=View()):
     payload = {"question": state.question, "conditions": state.conditions,
                "selected_evidence": [{"id": e.id, "title": e.title, "text": e.text} for e in state.selected],
-               "context": state.context, "remaining_budget": state.budget}
-    # Serialization-only equivalent views: preserve every semantic field and ID.
+               "context": "\n\n".join(x for x in (state.context, view.context_suffix) if x),
+               "remaining_budget": state.budget}
+    # Review metadata never enters the prompt. Original state/trajectory stays immutable.
     if view.style % 3 == 0:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
     if view.style % 3 == 1:
