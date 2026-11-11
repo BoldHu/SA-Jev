@@ -265,16 +265,25 @@ def hard_candidates(questions, corpus, k=64, dense=False, embedding_model="sente
     """Training-only mining. No negative label is inferred merely from retrieval."""
     from rank_bm25 import BM25Okapi
     import numpy as np
+    from tqdm.auto import tqdm
+    started = time.perf_counter()
+    print("[tasks] Deduplicating training corpus for candidate mining...", flush=True)
     corpus = deduplicate(corpus)
+    print(f"[tasks] Mining corpus: {len(corpus):,} unique documents; dense={dense}; no LLM API calls", flush=True)
     tokenize = lambda s: re.findall(r"\w+", s.lower())
-    bm25 = BM25Okapi([tokenize(e.title + " " + e.text) for e in corpus])
+    tokens = [tokenize(e.title + " " + e.text) for e in tqdm(corpus, desc="BM25 tokenize", unit="doc", mininterval=5)]
+    print("[tasks] Building BM25 statistics (CPU); waiting for index construction...", flush=True)
+    bm25 = BM25Okapi(tokens)
+    del tokens
+    print(f"[tasks] BM25 ready after {time.perf_counter()-started:.1f}s; scoring training questions next", flush=True)
     encoder = vectors = None
     if dense:
+        print("[tasks] Encoding training corpus for optional local dense mining...", flush=True)
         from sentence_transformers import SentenceTransformer
         encoder = SentenceTransformer(embedding_model)
         vectors = encoder.encode([e.title + " " + e.text for e in corpus], normalize_embeddings=True)
     result = {}
-    for q in questions:
+    for q in tqdm(questions, desc="Mine training candidates", unit="question", mininterval=5):
         lexical = np.argsort(-bm25.get_scores(tokenize(q.question)))[:k]
         indices = list(lexical)
         if dense:
@@ -282,4 +291,5 @@ def hard_candidates(questions, corpus, k=64, dense=False, embedding_model="sente
             semantic = np.argsort(-(vectors @ query))[:k]
             indices = [i for pair in zip(lexical, semantic) for i in pair]
         result[q.id] = deduplicate([corpus[i] for i in indices])[:k]
+    print(f"[tasks] Candidate mining complete: {len(result):,} questions in {time.perf_counter()-started:.1f}s", flush=True)
     return result

@@ -232,26 +232,39 @@ def download_2wiki(directory):
 
 def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False, dense=False, small_k=False):
     directory = Path(data_directory)
-    questions = [Question.from_dict(r) for r in read_jsonl(directory / "questions.jsonl")]
+    started = time.perf_counter()
+    print(f"[tasks 1/8] Reading questions from {directory}; mine={mine}, dense={dense}, small_k={small_k}", flush=True)
+    questions = [Question.from_dict(r) for r in _progress_rows(read_jsonl(directory / "questions.jsonl"), "read task questions")]
     training = sample_training(questions, counts, seed)
+    print(f"[tasks 1/8] Selected {len(training):,} training questions from {len(questions):,} total questions", flush=True)
     retrieved = None
+    print(f"[tasks 2/8] Training candidate mining {'enabled' if mine else 'skipped'}", flush=True)
     if mine:
-        corpus = [Evidence(**r) for r in read_jsonl(directory / "corpus.jsonl")]
+        corpus = [Evidence(**r) for r in _progress_rows(read_jsonl(directory / "corpus.jsonl"), "read mining corpus")]
         retrieved = hard_candidates(training, corpus, dense=dense)
+    print("[tasks 3/8] Building states and support-derived task labels...", flush=True)
     states = build_training_states(training, retrieved, seed, budget, small_k=small_k)
+    print(f"[tasks 3/8] Built {len(states):,} states; rank-valid={sum(x.labels.rank_valid for x in states):,}", flush=True)
     initials = [x.state for x in states if not x.state.selected_ids]
+    print("[tasks 4/8] Building full-trajectory preference pairs (up to 3,000)...", flush=True)
     pairs = build_preferences(training, initials, seed=seed)
+    print(f"[tasks 4/8] Built {len(pairs):,} preference pairs", flush=True)
+    print("[tasks 5/8] Auditing question-family separation...", flush=True)
     audit_splits(questions, states, pairs, [q.group_id for q in questions if q.split == "heldout"])
     suffix = "_small_k" if small_k else ""
-    write_jsonl(directory / f"train_states{suffix}.jsonl", states)
-    write_jsonl(directory / f"preferences{suffix}.jsonl", pairs)
+    print("[tasks 6/8] Saving training states and preferences; Drive writes may take time...", flush=True)
+    write_jsonl(directory / f"train_states{suffix}.jsonl", _progress_rows(states, "write task states", total=len(states)))
+    write_jsonl(directory / f"preferences{suffix}.jsonl", _progress_rows(pairs, "write preferences", total=len(pairs)))
     # Validation MUST come from retrieved pools, no training-pool gold injection.
+    print("[tasks 7/8] Building validation states from existing retrieved pools (no new retrieval)...", flush=True)
     cache = PoolCache(directory / "pools")
     validation = []
-    for q in questions:
-        if q.split == "validation" and cache.path(q.id).exists():
+    validation_questions = [q for q in questions if q.split == "validation"]
+    for q in _progress_rows(validation_questions, "validation questions", total=len(validation_questions)):
+        if cache.path(q.id).exists():
             validation.extend(task_states(q, cache.read(q.id), budget, seed))
-    write_jsonl(directory / "validation_states.jsonl", validation)
+    write_jsonl(directory / "validation_states.jsonl", _progress_rows(validation, "write validation states", total=len(validation)))
+    print("[tasks 8/8] Computing fingerprints and writing task manifest; this may take time for large states...", flush=True)
     manifest = {"training_questions": len(training), "task_states": len(states), "preferences": len(pairs),
                 "validation_states": len(validation), "rank_valid": sum(x.labels.rank_valid for x in states),
                 "validation_rank_valid": sum(x.labels.rank_valid for x in validation),
@@ -266,6 +279,9 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
     if validation and not manifest["validation_rank_valid"]:
         print("Validation has no fully known ranking targets; rank loss is unavailable. "
               "Inspect pool coverage/annotations before interpreting ranking validation; unknowns remain masked.", flush=True)
+    print(f"[tasks] Complete in {time.perf_counter()-started:.1f}s: train={len(training):,}, "
+          f"states={len(states):,}, preferences={len(pairs):,}, validation_states={len(validation):,}; "
+          f"manifest={directory / f'task_manifest{suffix}.json'}", flush=True)
     return manifest
 
 

@@ -200,8 +200,9 @@ def task_states(q, pool, budget=4, seed=17, max_states=3):
 
 
 def build_training_states(questions, retrieved=None, seed=17, budget=4, small_k=False):
+    from tqdm.auto import tqdm
     rng, rows = random.Random(seed), []
-    for q in questions:
+    for q in tqdm(questions, desc="Build task states", unit="question", mininterval=5):
         k = 8 if small_k else rng.choices([8, 16, 32, 64], [.4, .3, .2, .1])[0]
         candidates = (retrieved or {}).get(q.id, ())
         pool = training_pool(q, candidates, k)

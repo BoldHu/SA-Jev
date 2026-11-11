@@ -119,11 +119,12 @@ def preference(q, a, b):
 
 
 def build_preferences(questions, initial_states, limit=3000, seed=17):
+    from tqdm.auto import tqdm
     lookup = {q.id: q for q in questions}
     rng = random.Random(seed)
     states = list(initial_states); rng.shuffle(states)
     result, seen = [], set()
-    for state in states:
+    for state in tqdm(states, desc="Build trajectory preferences", unit="question", mininterval=5):
         q = lookup[state.question_id]
         if q.split != "train": raise ValueError("preference data is training-only")
         candidates = [_rollout(q, state, mode, rng) for mode in ("greedy", "redundant", "early", "random")]
