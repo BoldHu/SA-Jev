@@ -85,9 +85,9 @@ class SAJev(nn.Module):
                         branch_microbatch=1, trainable=True, lora_rank=16, lora_alpha=32,
                         max_branch_length=None, max_decision_tokens=None):
         from openjev.artifacts import load_decision_artifact, sha256_file
-        from openjev.runtime.hub import resolve_artifact
+        from .artifact_cache import prepare_openjev_artifact
         from openjev.models.decision.serializer import DecisionSerializer
-        path = resolve_artifact(artifact, revision=revision)
+        path = prepare_openjev_artifact(artifact, revision=revision)
         core, tokenizer, config, calibration = load_decision_artifact(path, device=device, dtype="bfloat16")
         core.branch_microbatch_size = branch_microbatch
         core.checkpoint_branches = trainable

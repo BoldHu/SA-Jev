@@ -130,6 +130,8 @@ create('00_environment_data.ipynb', '# SA-Jev · 公开 LightRAG 索引与数据
 ('code', "from sa_jev.environment import disconnect_after_preparation\ndisconnect_after_preparation(ROOT, run_id=PREPARATION_RUN_ID, enabled=AUTO_DISCONNECT)")])
 
 create('01_original_diagnostics.ipynb', '# 原模型诊断\n先测重复调用噪声，再测无关上下文与大 K；不预设原模型不稳定。', [
+('md', '先核对 OpenJev 完整产物：固定 revision 的 manifest、各文件大小和 SHA-256。只有缺失/损坏文件才重下，坏缓存入口保留为 .invalid-*；不删除 00 数据或检索缓存。Colab 从 Drive 缓存复制到本机临时目录，以普通文件加载；约需额外 9 GB 本地磁盘，复制有进度，重新连接需要重新复制，通常不需要重新下载。此格不分配 4B GPU 模型。'),
+('code', "import importlib\nfrom sa_jev import artifact_cache, model, experiments\nfor module in (artifact_cache, model, experiments):\n    importlib.reload(module)\nverified_artifact = artifact_cache.prepare_openjev_artifact(config['model']['artifact'], config['model'].get('revision'))\nprint('Verified OpenJev artifact:', verified_artifact)"),
 ('code', "from sa_jev.experiments import diagnostics_experiment, efficiency_experiment\ndiagnostics_experiment(ROOT, config, limit=8 if MODE=='pilot' else 100)\nefficiency_experiment(ROOT, config, limit=8 if MODE=='pilot' else 100)"),
 ('code', "if os.environ.get('TYPESAFE_API_KEY') or os.environ.get('JEV_API_KEY'):\n    diagnostics_experiment(ROOT, config, method='dynamic_jev', limit=8 if MODE=='pilot' else 100)\n    efficiency_experiment(ROOT, config, method='dynamic_jev', limit=8 if MODE=='pilot' else 100)\nelse:\n    print('Official Jev API unavailable; no official-Jev result is reported.')"),
 ('md', '无关状态干扰使用独立且经过核验的测试包，保持不调参。未核验草稿不会被自动当成测试结果。'),

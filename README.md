@@ -25,7 +25,7 @@
 
 1. 每个 notebook 第一个代码单元的 `REPO_URL` 默认指向 `https://github.com/BoldHu/SA-Jev.git`，运行时自动克隆并同步代码，可通过环境变量 `SAJEV_REPO_URL` 覆盖。如需使用 ZIP，将 `REPO_URL` 改为 `''`，并将 `artifacts/sa-jev-source.zip` 放到 `MyDrive/SA-Jev/`。
 2. 填写项目根目录 `.env`（没有时从 `.env.example` 复制），上传到 `MyDrive/SA-Jev/.env`。所有 notebook 的第三个代码单元自动读取同一份文件；无需配置 Colab Secrets。`00_environment_data.ipynb` 默认恢复为 `MODE='pilot'`：先检查 tiny 流程和本地编码器，再下载小规模数据、构建固定 LightRAG 缓存、生成状态/轨迹、扫描 OpenJevData。结果保存在 `MyDrive/SA-Jev/pilot`，不下载或训练 OpenJev-4B 主模型。首个代码单元的 `AUTO_DISCONNECT=True` 会在准备成功且 Drive 写入刷新后释放 Colab 运行时。
-3. 运行 `01_original_diagnostics.ipynb`，先看重复调用与 K 扩展。独立无关扰动部分需要完成核验的测试包，不会用生成草稿冒充结果。
+3. 运行 `01_original_diagnostics.ipynb`，先执行新增的 OpenJev 权重校验格，再看重复调用与 K 扩展。权重按固定 revision 的 manifest 检查大小与 SHA-256，仅修复缺失/损坏文件，保留坏缓存入口，不删除数据或候选池。Colab 的 Drive 权重会复制为本机普通文件后加载，约需额外 9 GB 本地磁盘；复制与重新下载是两件事。独立无关扰动部分需要完成核验的测试包，不会用生成草稿冒充结果。
 4. 在单卡 A100 上依次运行 `02_stage1.ipynb`、`03_stage2.ipynb`。保持 `MODE='pilot'` 和 `ROOT = DRIVE / MODE`，直接读取 00 准备的 pilot 数据；训练 pilot 默认各两个 optimizer step。检查 loss、梯度、实测显存、checkpoint 重载和 ETA，再决定全量训练。确认实际分配显存，主实验上限是 A100 80GB。
 5. 运行 `04_main_comparison.ipynb`，确认相同池、预算、回答器以及逐题结果可比较。pilot 可以只取少量题。
 6. 模型 pilot 通过后，先将 **00 首个代码单元**的 `MODE` 改为 `'full'`，完整运行一次，另存 `MyDrive/SA-Jev/full`。pilot 数据不能代替这次全量准备。然后将实验 notebook 的 `MODE` 改成 `'full'`，执行 01→02→03→04；随后执行 05（独立稳定性/有效变化）、06（消融）、07（效率）、08（工业案例）。正式主实验默认三个种子。已完成的 full 主实验数据无需重复准备。若此前已完成 full 数据却尚未测试模型，可先保持训练 notebook 的 `MODE='pilot'`，仅把 `ROOT` 改成 `DRIVE / 'full'` 做少步验证，之后再恢复 `ROOT = DRIVE / MODE`。
