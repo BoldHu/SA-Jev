@@ -10,6 +10,26 @@ from pathlib import Path
 from dataclasses import asdict, is_dataclass
 
 
+@contextmanager
+def progress_phase(label, interval=30):
+    """Elapsed-time notices for a blocking stage; not a claim of forward progress."""
+    from threading import Event, Thread
+    started, stopped = time.perf_counter(), Event()
+    print(f"{label}: starting", flush=True)
+    def notice():
+        while not stopped.wait(interval):
+            print(f"{label}: elapsed={time.perf_counter()-started:.0f}s; "
+                  "waiting for this stage to return (not a progress percentage)", flush=True)
+    worker = Thread(target=notice, daemon=True)
+    worker.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        worker.join()
+        print(f"{label}: exited after {time.perf_counter()-started:.1f}s", flush=True)
+
+
 def progress_rows(rows, label, *, total=None):
     """Plain flushed stdout, including in notebooks without working widgets.
 

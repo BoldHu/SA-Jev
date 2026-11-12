@@ -8,6 +8,8 @@
 
 ## 当前入口：公开 LightRAG 索引
 
+01 诊断进度修复：保留 `MODE='full'` 和已准备的 full 数据目录，在权重校验后的设置格使用 `RUN_FULL_DIAGNOSTICS=False`，先做 2 题重复诊断和 K=16 的 2 题效率检查；确认成功后设为 True，full 模式执行原定 100 题和全部 K。两个实验已拆成独立代码格。BF16 4B 实验优先用 A100；T4 没有原生 BF16 支持，不能用约 9GB 显存占用判断推理正常或快慢。加载阶段有每 30 秒的等待提示（不代表完成百分比）；每次重复推理打印 START/DONE、耗时、ETA、显存或错误，并保存到 `results/diagnostics/openjev_frozen/raw.jsonl`。同一次新调用会重新开始该诊断文件，不是断点续跑。中断旧版诊断不会修改 00 数据，但旧版尚未输出的诊断行没有落盘。刷新浏览器后显示的 0% 进度条可能不是当前实际加载进度。`fast path` 提示也不等于整个模型在 CPU：官方适配保留 torch 卷积，同时单独使用 FLA delta 内核，新加载日志会显示实际内核。
+
 **验证/扰动题来源已改为公开图配套清单内划分。** 新问题协议为 `published_family_split_v2`：HotpotQA/MuSiQue 每库 300 测试、100 验证、100 扰动保留，2Wiki 500 测试。旧划分曾使用图外题，必须先重跑 00 数据准备单元迁移；无需重建图。有效排序监督数量和人工扰动核验仍需检查，技术联调不代表论文性能。见 [覆盖审计与协议边界](docs/PUBLIC_INDEX_PROTOCOL.md)。
 
 默认已改为 `configs/public_lightrag.yaml`，使用 HotpotQA、MuSiQue、2Wiki 的三套公开图，共 15,859 段；不再为全部原始训练段落付费建图。完整说明、来源、ZIP 修复记录和评测边界见 [公开索引协议](docs/PUBLIC_INDEX_PROTOCOL.md)。

@@ -192,33 +192,50 @@ def main_experiment(root, config, methods=None, seeds=None, limit=None, qa=True,
 
 def efficiency_experiment(root, config, method="openjev_frozen", limit=50, seed=17):
     root = Path(root); cache = PoolCache(root/"data/pools_max")
+    print(f"[efficiency] Preparing {method}; requested question limit={limit}", flush=True)
     questions = [q for q in read_questions(root) if q.split == "test"][:limit]
+    print(f"[efficiency] {len(questions)} questions per K; K={config['evaluation']['k_values']}; loading model...", flush=True)
     model, policy = load_method(root, config, method, seed); rows = []
+    print(f"[efficiency] Model ready on {model.device}", flush=True)
+    train_manifest = root / "data/task_manifest.json"
+    training_max_k = max(map(int, read_json(train_manifest).get("actual_k_counts", {})), default=0) if train_manifest.exists() else None
     if isinstance(model, SAJev):
         # Logical branch-set budget is a serializer guard, not the per-branch
         # backbone context. Declare the expansion explicitly for K extrapolation.
         model.serializer.max_decision_tokens = config["evaluation"]["efficiency_max_decision_tokens"]
     for k in config["evaluation"]["k_values"]:
+        print(f"[efficiency] START K={k}: {len(questions)} questions; each may take up to {config['data']['budget']} READ decisions", flush=True)
         pools = {q.id: slice_pool(cache.read(q.id), k) for q in questions}
         measured = evaluate(model, questions, pools, root/f"results/efficiency/{method}/K{k}", name=method,
                             policy=policy, budget=config["data"]["budget"], seed=seed)
         for r in measured:
-            r.update(requested_k=k, extrapolation=k>64, exact_k=r["k"] == k,
+            r.update(requested_k=k, training_max_k=training_max_k,
+                     extrapolation=(r["k"] > training_max_k) if training_max_k else None, exact_k=r["k"] == k,
                      max_decision_tokens=config["evaluation"]["efficiency_max_decision_tokens"] if isinstance(model, SAJev) else None)
         rows.extend(measured)
     export_report(rows, root/f"results/efficiency/{method}",
                   ("support_recall", "seconds", "logical_tokens", "executed_tokens", "peak_reserved_gib"), ("method", "requested_k", "exact_k"))
+    del model; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    print(f"[efficiency] Complete: {root/f'results/efficiency/{method}'}", flush=True)
     return rows
 
 
 def diagnostics_experiment(root, config, method="openjev_frozen", limit=50, seed=17):
     root = Path(root); cache = PoolCache(root/"data/pools")
+    print(f"[diagnostics] Reading questions and cached pools; method={method}, limit={limit}", flush=True)
     questions = [q for q in read_questions(root) if q.split == "validation"][:limit]
     states = [State(q.id, q.group_id, q.question, cache.read(q.id), budget=config["data"]["budget"]) for q in questions]
+    print(f"[diagnostics] Prepared {len(states)} states; loading model...", flush=True)
     model, _ = load_method(root, config, method, seed)
-    rows = repeat_diagnostics(model, states, config["evaluation"]["repeats"])
+    print(f"[diagnostics] Model ready on {model.device}", flush=True)
+    rows = repeat_diagnostics(model, states, config["evaluation"]["repeats"],
+                              output=root/f"results/diagnostics/{method}")
     for row in rows: row["method"] = method
     export_report(rows, root/f"results/diagnostics/{method}", ("js", "top1_flip", "top5_change", "suf_flip", "seconds"), ("method",))
+    del model; gc.collect()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    print(f"[diagnostics] Complete: {root/f'results/diagnostics/{method}'}", flush=True)
     return rows
 
 

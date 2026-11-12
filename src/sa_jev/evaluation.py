@@ -207,12 +207,21 @@ def evaluate(model, questions, pools, output, *, name="openjev_frozen", policy="
 
 
 @torch.no_grad()
-def repeat_diagnostics(model, states, repeats=3):
+def repeat_diagnostics(model, states, repeats=3, output=None):
     model.eval(); rows = []
-    for state in states:
+    started = time.perf_counter()
+    total = len(states) * repeats
+    print(f"[diagnostics] {len(states)} questions x {repeats} repeats = {total} forwards; device={model.device}", flush=True)
+    if output is not None:
+        output = Path(output)
+        write_jsonl(output / "raw.jsonl", [])
+    for index, state in enumerate(states):
         first = None
         for repeat in range(repeats):
+            print(f"[diagnostics] START {len(rows)+1}/{total}: question={index+1}/{len(states)} "
+                  f"repeat={repeat+1}/{repeats} K={len(state.candidates)} id={state.question_id}", flush=True)
             synchronize(model.device); start = time.perf_counter()
+            if model.device.type == "cuda": torch.cuda.reset_peak_memory_stats(model.device)
             row = {"question_id": state.question_id, "group_id": state.group_id, "repeat": repeat,
                          "pool_hash": state.pool.fingerprint, "k": len(state.candidates),
                          "status": "ok"}
@@ -229,4 +238,10 @@ def repeat_diagnostics(model, states, repeats=3):
                 row.update(executed_tokens=None, allocated_gib=None, reserved_gib=None, peak_allocated_gib=None, peak_reserved_gib=None,
                            cost_scope="client_wall_time_and_reported_API_usage")
             rows.append(row)
+            if output is not None: write_jsonl(output / "raw.jsonl", rows)
+            elapsed = time.perf_counter()-started
+            print(f"[diagnostics] DONE {len(rows)}/{total}: status={row['status']} "
+                  f"seconds={row['seconds']:.1f} ETA={elapsed/len(rows)*(total-len(rows)):.1f}s "
+                  f"peak_reserved_gib={row['peak_reserved_gib']}" +
+                  (f" error={row['error']}" if row['status'] == "error" else ""), flush=True)
     return rows
