@@ -1,11 +1,12 @@
 # 实际验证记录
 
-日期：2026-11-07 至 2026-11-11（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
+日期：2026-11-07 至 2026-11-12（Asia/Shanghai）。所有数值来自本机实际运行，均为工程/方法契约测试，不是 SA-Jev-4B 论文结果。
 
 ## 已运行
 
 | 检查 | 实际结果 | 可追溯输出 |
 |---|---|---|
+| 训练未知候选与排序覆盖修复 | 完整套件 **89 passed**（103.23s），9 个 notebook 格式与代码语法通过。新增测试覆盖未知项剔除但掩码不取消、保留已标注干扰段、完整候选归一化与排序反向梯度、修复备份、验证状态/问题/缓存不改动、问题抽样不一致时拒绝发布、偏好轨迹合法重放。真实本地 HotpotQA/MuSiQue 各 4 题共 24 状态：排序有效 **6 → 16**，剩余 8 状态已充分；实际 K 为 8/10/16/20。无 API、无 BM25、无 4B 训练。云盘连接仍为另一账号，未直接读取或修改用户云端全量文件；正式验证排序覆盖仍未修复 | `tests/test_task_repair.py`；`outputs/rank_repair_real_4i0trmx9/verification.json`；`docs/RANK_LABEL_REPAIR_ZH.md` |
 | OpenJev 分片完整性修复与 Drive 本地物化 | 完整套件 **86 passed**（37.10s）；新增 8 个测试覆盖第三分片缺失/大小错误、同大小内容损坏、单文件修复与正常文件复用、普通本地副本及复用、重下一次仍失败时停止、manifest/路径检查、用户本地产物不自动修复、模型使用已验证路径。9 个 notebook 格式/语法通过，01 保留原用户设置和历史输出并新增校验格。仅联网读取固定 revision 的小 manifest：第三分片官方大小 **440,425,856 bytes**、SHA-256 `03f15fc4f5773f2ca6bcd863d968ae2db0c002b206dd357d2edfa2e68a4e8289`。使用真实本地 tiny Qwen3.5/OpenJev 产物验证原决策头完全一致、BF16 骨干/FP32 head、LoRA 梯度与检查点重载。未下载完整 4B、未连接用户 Drive、未确认其坏分片的具体成因 | `tests/test_artifact_cache.py`；`outputs/artifact_repair_native_mzf73fb1/verification.json` |
 | 核验上下文双视图 | 完整套件 **78 passed**（29.93s），包含 context 来源排除、审核缓存复用、截断/格式错误中止、修改状态/标签拒绝、混合 batch 分母、超 token 预算跳过、真实反向传播/DPO 和逐参数一致的断点续训。9 个 notebook 格式/代码语法通过，03/06 新入口已接入。真实 API 最终三个探针均返回完整 JSON，一条主题背景通过、两条不贴题拒绝；请求别名 DeepSeek-V4.1-Flash，响应名 DeepSeek-Flash，不据此确认后端权重身份。开发中实际共 7 次探针请求（包含前两次推理预算耗尽）；已加 DeepSeek 关闭 thinking 与不完整审核立即停止。用通过审核的一条真实 MuSiQue 问题、3 个真实状态、3 对既有偏好运行 tiny Stage 1 一步/Stage 2 两步，3 个 context 视图实际参与训练，轨迹指纹不变。该检查的稳定性值为 0（落在容忍区间），不证明鲁棒性提升；无 4B/A100/full 训练 | `tests/test_context_views.py`；`outputs/context_screen_kupxnv6y/live_reviews_final.json`；`outputs/context_real_smoke_fu58oquf/verification.json` |
 | 编码器校验与实际加载路径绑定 | **14 passed**（38.85s），覆盖持久缓存修复、本地普通文件物化、仅补缺失的小元数据、本地权重复用、复制失败拒绝加载、SentenceTransformer 显式离线路径。真实 MiniLM 全程离线 CPU 加载/编码通过，直接加载与本地副本向量最大差 **0.0**；三套公开图各三个已存向量兼容检查最小 cosine 日志均为 1.000000。持久权重 SHA-256 不变，无权重下载、无 API。00 编码器格重载模块，格式语法通过，历史输出/执行次数保留。未复现用户 Drive 具体故障，不将路径/映射推断称为已确认根因 | `outputs/embedding_local_snapshot_gh9tj7vq/verification.json`；`pytest -q tests/test_embedding_weight_repair.py tests/test_local_embeddings.py` |

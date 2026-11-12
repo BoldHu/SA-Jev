@@ -214,8 +214,10 @@ def download_2wiki(directory):
     print("[data] 2Wiki download/extraction complete.", flush=True)
 
 
-def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False, dense=False, small_k=False):
+def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False, dense=False, small_k=False,
+                  output_directory=None, rebuild_validation=True):
     directory = Path(data_directory)
+    output = Path(output_directory) if output_directory is not None else directory
     started = time.perf_counter()
     print(f"[tasks 1/8] Reading questions from {directory}; mine={mine}, dense={dense}, small_k={small_k}", flush=True)
     questions = [Question.from_dict(r) for r in _progress_rows(read_jsonl(directory / "questions.jsonl"), "read task questions")]
@@ -237,19 +239,25 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
     audit_splits(questions, states, pairs, [q.group_id for q in questions if q.split == "heldout"])
     suffix = "_small_k" if small_k else ""
     print("[tasks 6/8] Saving training states and preferences; Drive writes may take time...", flush=True)
-    write_jsonl(directory / f"train_states{suffix}.jsonl", _progress_rows(states, "write task states", total=len(states)))
-    write_jsonl(directory / f"preferences{suffix}.jsonl", _progress_rows(pairs, "write preferences", total=len(pairs)))
+    write_jsonl(output / f"train_states{suffix}.jsonl", _progress_rows(states, "write task states", total=len(states)))
+    write_jsonl(output / f"preferences{suffix}.jsonl", _progress_rows(pairs, "write preferences", total=len(pairs)))
     # Validation MUST come from retrieved pools, no training-pool gold injection.
     print("[tasks 7/8] Building validation states from existing retrieved pools (no new retrieval)...", flush=True)
     cache = PoolCache(directory / "pools")
     validation = []
     validation_questions = [q for q in questions if q.split == "validation"]
-    for q in _progress_rows(validation_questions, "validation questions", total=len(validation_questions)):
-        if cache.path(q.id).exists():
-            validation.extend(task_states(q, cache.read(q.id), budget, seed))
-    write_jsonl(directory / "validation_states.jsonl", _progress_rows(validation, "write validation states", total=len(validation)))
+    if rebuild_validation:
+        for q in _progress_rows(validation_questions, "validation questions", total=len(validation_questions)):
+            if cache.path(q.id).exists():
+                validation.extend(task_states(q, cache.read(q.id), budget, seed))
+        write_jsonl(output / "validation_states.jsonl", _progress_rows(validation, "write validation states", total=len(validation)))
+    else:
+        validation = [TaskExample.from_dict(row) for row in read_jsonl(directory / "validation_states.jsonl")]
+        audit_splits(questions, validation)
+        print("[tasks] Existing validation states retained unchanged; no gold filtering.", flush=True)
     print("[tasks 8/8] Computing fingerprints and writing task manifest; this may take time for large states...", flush=True)
-    manifest = {"training_questions": len(training), "task_states": len(states), "preferences": len(pairs),
+    manifest = {"candidate_protocol": "known_candidates_v1", "seed": seed, "budget": budget,
+                "training_questions": len(training), "task_states": len(states), "preferences": len(pairs),
                 "validation_states": len(validation), "rank_valid": sum(x.labels.rank_valid for x in states),
                 "validation_rank_valid": sum(x.labels.rank_valid for x in validation),
                 "validation_suf_valid": sum(x.labels.suf_valid for x in validation),
@@ -259,13 +267,13 @@ def prepare_tasks(data_directory, *, seed=17, budget=4, counts=None, mine=False,
                 "actual_k_counts": {k: sum(len(x.state.pool.candidates) == k for x in states if not x.state.selected_ids) for k in sorted({len(x.state.pool.candidates) for x in states})},
                 "state_fingerprint": digest(states), "preference_fingerprint": digest(pairs),
                 "unknown_labels": "masked; short pools are never padded"}
-    write_json(directory / f"task_manifest{suffix}.json", manifest)
+    write_json(output / f"task_manifest{suffix}.json", manifest)
     if validation and not manifest["validation_rank_valid"]:
         print("Validation has no fully known ranking targets; rank loss is unavailable. "
               "Inspect pool coverage/annotations before interpreting ranking validation; unknowns remain masked.", flush=True)
     print(f"[tasks] Complete in {time.perf_counter()-started:.1f}s: train={len(training):,}, "
           f"states={len(states):,}, preferences={len(pairs):,}, validation_states={len(validation):,}; "
-          f"manifest={directory / f'task_manifest{suffix}.json'}", flush=True)
+          f"manifest={output / f'task_manifest{suffix}.json'}", flush=True)
     return manifest
 
 

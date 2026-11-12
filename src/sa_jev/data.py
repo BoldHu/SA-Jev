@@ -170,12 +170,20 @@ def training_pool(q, retrieved=(), k=16):
     if q.split != "train":
         raise ValueError("gold-supported training pools are forbidden in evaluation")
     positives = [e for e in q.evidence if q.coverage.get(e.id)]
-    negatives = [e for e in q.evidence if not q.coverage.get(e.id)]
-    pool = deduplicate([*positives, *retrieved, *negatives])[:k]
+    # Original annotated distractors are proxy negatives. Unannotated external
+    # retrieval must never crowd them out or silently become zero-target items.
+    negatives = [e for e in q.evidence if not q.coverage.get(e.id)
+                 and (e.id in q.coverage or e.id in q.known_negative_ids)]
+    retrieved = deduplicate(retrieved)
+    probe = State(q.id, q.group_id, q.question, Pool(q.id, retrieved, "training_label_probe"))
+    known_retrieved = [e for e, valid in zip(retrieved, labels_for(q, probe).rel_valid) if valid]
+    pool = deduplicate([*positives, *negatives, *known_retrieved])[:k]
     # IDs and order reveal no gold status. Selection labels stay out of inputs.
     pool = tuple(sorted(pool, key=lambda e: digest([q.id, e.id, "pool-order"])))
     return Pool(q.id, pool, "training_supervision", {"requested_k": k, "actual_k": len(pool),
-                "gold_injected": True, "purpose": "training_only"})
+                "gold_injected": True, "purpose": "training_only",
+                "candidate_protocol": "known_candidates_v1",
+                "unknown_retrieved_excluded": len(retrieved) - len(known_retrieved)})
 
 
 def task_states(q, pool, budget=4, seed=17, max_states=3):
