@@ -153,7 +153,7 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
             pairs = [PreferencePair.from_dict(x) for x in read_jsonl(data/f"preferences{suffix}.jsonl")]
             reference = cache_reference(model, pairs, root/f"reference/seed_{seed}{suffix}.json")
     from .io import progress_phase
-    with progress_phase(f"[train] Stage {stage} run; progress below, output={output}"):
+    with progress_phase(f"[train] Stage {stage} run; progress below, output={output}", interval=120):
         history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume,
                       context_bank=context_bank)
     training_report(history, output)

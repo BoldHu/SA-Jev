@@ -8,6 +8,7 @@ model:
   revision: 064bd435c6713486450194e29d526266b28941e2
   device: cuda
   branch_microbatch: 1
+  decision_batch_size: 8
   lora_rank: 16
   lora_alpha: 32
   max_branch_length: 8192
@@ -40,6 +41,7 @@ training:
   context_view_mode: reviewed_context
   epochs: 1
   accumulation: 8
+  state_batch_size: 2
   learning_rate: 2.0e-05
   head_learning_rate: 0.0001
   weight_decay: 0.01

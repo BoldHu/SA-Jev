@@ -28,12 +28,16 @@ class Prediction:
 
 
 class SAJev(nn.Module):
-    def __init__(self, core, tokenizer, serializer, *, temperature=1., base_identity="", lora_config=None):
+    def __init__(self, core, tokenizer, serializer, *, temperature=1., base_identity="", lora_config=None,
+                 decision_batch_size=8):
         super().__init__()
+        if isinstance(decision_batch_size, bool) or not isinstance(decision_batch_size, int) or decision_batch_size < 1:
+            raise ValueError("decision_batch_size must be a positive integer")
         self.core, self.tokenizer, self.serializer = core, tokenizer, serializer
         self.temperature = float(temperature)
         self.base_identity = base_identity
         self.lora_config = lora_config
+        self.decision_batch_size = decision_batch_size
 
     @property
     def device(self): return next(self.parameters()).device
@@ -52,38 +56,76 @@ class SAJev(nn.Module):
         return True
 
     def decision(self, body):
+        return self.decisions([body])[0]
+
+    def decisions(self, bodies):
+        """Batch independent complete decisions, preserving order and separate softmaxes.
+
+        Similar lengths share padding; each decision keeps its own option mask and
+        Interactor row. No candidate is removed and no support input is merged.
+        """
         from openjev.api.typesafe import parse_request
         from openjev.data.collator import collate_serialized
-        parsed = parse_request(body, model_ids=set())
-        if len(parsed) != 1:
-            raise ValueError("one complete decision per call")
-        encoded = self.serializer(parsed[0].decision)
+        encoded = []
+        for body in bodies:
+            parsed = parse_request(body, model_ids=set())
+            if len(parsed) != 1:
+                raise ValueError("one complete decision per request")
+            encoded.append(self.serializer(parsed[0].decision))
         pad = self.tokenizer.pad_token_id
         if pad is None: pad = self.tokenizer.eos_token_id
-        batch = collate_serialized([encoded], pad)
-        batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-        output = self.core(batch, temperature=self.temperature)
-        return output.log_probs[0], encoded.logical_token_count, batch["input_ids"].numel()
+        order = sorted(range(len(encoded)), key=lambda i: max(len(b.input_ids) for b in encoded[i].branches))
+        results = [None] * len(encoded)
+        for start in range(0, len(order), self.decision_batch_size):
+            indices = order[start:start+self.decision_batch_size]
+            batch = collate_serialized([encoded[i] for i in indices], pad)
+            length = batch["input_ids"].shape[1]
+            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            output = self.core(batch, temperature=self.temperature)
+            for row, index in enumerate(indices):
+                item = encoded[index]
+                results[index] = (output.log_probs[row, :len(item.option_ids)],
+                                  item.logical_token_count, len(item.branches)*length)
+        return results
 
     def forward(self, state, view=View(), include_rel=True):
-        choice, suf, rel = requests(state, view, include_rel)
-        log_h, logical, executed = self.decision(suf)
-        if choice:
-            log_p, n, m = self.decision(choice)
-            logical += n; executed += m
-        else:
+        return self.forward_batch([state], [view], include_rel=include_rel)[0]
+
+    def forward_batch(self, states, views=None, include_rel=True):
+        """Multiple states share execution, never inputs, labels or normalization.
+
+        Group task types separately to avoid padding short relevance inputs to
+        the length of selected-evidence contexts. ``decisions`` further groups
+        by length and restores order, with a complete K-way mask for each row.
+        """
+        states = list(states)
+        views = [View()] * len(states) if views is None else list(views)
+        if len(states) != len(views):
+            raise ValueError("one view is required per state")
+        if not states:
+            return []
+        bodies = [requests(state, view, include_rel) for state, view in zip(states, views)]
+        sufficient = self.decisions([suf for _, suf, _ in bodies])
+        choices = iter(self.decisions([choice for choice, _, _ in bodies if choice is not None]))
+        relevance = iter(self.decisions([body for _, _, rel in bodies for body in rel]))
+        predictions = []
+        for state, (choice, _, rel), (log_h, logical, executed) in zip(states, bodies, sufficient):
             log_p = log_h.new_empty((0,))
-        log_rel = []
-        for body in rel:
-            value, n, m = self.decision(body)
-            log_rel.append(value); logical += n; executed += m
-        return Prediction(tuple(e.id for e in state.candidates), log_p, log_h,
-                          torch.stack(log_rel) if log_rel else log_h.new_empty((0, 2)), logical, executed)
+            if choice is not None:
+                log_p, n, m = next(choices)
+                logical += n; executed += m
+            log_rel = []
+            for _ in rel:
+                value, n, m = next(relevance)
+                log_rel.append(value); logical += n; executed += m
+            predictions.append(Prediction(tuple(e.id for e in state.candidates), log_p, log_h,
+                               torch.stack(log_rel) if log_rel else log_h.new_empty((0, 2)), logical, executed))
+        return predictions
 
     @classmethod
     def from_pretrained(cls, artifact="shenjunhao/OpenJev-4B", *, revision=None, device="cuda",
                         branch_microbatch=1, trainable=True, lora_rank=16, lora_alpha=32,
-                        max_branch_length=None, max_decision_tokens=None):
+                        max_branch_length=None, max_decision_tokens=None, decision_batch_size=8):
         from openjev.artifacts import load_decision_artifact, sha256_file
         from .artifact_cache import prepare_openjev_artifact
         from .io import progress_phase
@@ -99,6 +141,7 @@ class SAJev(nn.Module):
                   f"convolution={'causal_conv1d' if delta.causal_conv1d_fn is not None else 'torch'}", flush=True)
         core.branch_microbatch_size = branch_microbatch
         core.checkpoint_branches = trainable
+        print(f"[OpenJev] branch_microbatch={branch_microbatch}, independent decision batch={decision_batch_size}", flush=True)
         core.requires_grad_(False)
         lora = None
         if trainable:
@@ -113,7 +156,13 @@ class SAJev(nn.Module):
         if max_decision_tokens is not None: args["max_decision_tokens"] = max_decision_tokens
         result = cls(core, tokenizer, DecisionSerializer(tokenizer, **args),
                      temperature=calibration["temperature"],
-                     base_identity=sha256_file(Path(path) / "manifest.json"), lora_config=lora)
+                     base_identity=sha256_file(Path(path) / "manifest.json"), lora_config=lora,
+                     decision_batch_size=decision_batch_size)
+        if trainable:
+            total = sum(p.numel() for p in result.parameters())
+            updated = sum(p.numel() for p in result.parameters() if p.requires_grad)
+            print(f"[OpenJev] LoRA + decision head trainable parameters: {updated:,}/{total:,} "
+                  f"({100*updated/total:.2f}%); original backbone weights frozen", flush=True)
         result.train(trainable)
         return result
 

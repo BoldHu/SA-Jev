@@ -137,11 +137,20 @@ def test_real_two_stage_context_dpo_and_resume(prepared):
     pairs = build_preferences(qs, [x.state for x in train if not x.state.selected_ids], limit=3)
     original_pairs = digest(pairs)
     reference = cache_reference(model, pairs, root / "reference.json")
-    cfg2 = TrainConfig(stage=2, context_view_mode="reviewed_context", accumulation=1,
+    cfg2 = TrainConfig(stage=2, context_view_mode="reviewed_context", accumulation=2, state_batch_size=2,
                        max_steps=2, save_every=1, validate_every=2)
     history = fit(model, train, val, cfg2, root / "stage2", pairs=pairs, reference=reference, context_bank=bank)
-    assert all(h["context_pairs"] == 1 and h["valid_stab_suf"] == 1 for h in history)
+    assert [h["context_pairs"] for h in history] == [2, 1]  # Final effective batch is short.
+    assert [h["valid_stab_suf"] for h in history] == [2, 1]
     assert digest(pairs) == original_pairs
+    serial = tiny_model(); serial.load_trainable(stage1)
+    serial_history = fit(serial, train, val, replace(cfg2, state_batch_size=1), root / "serial_stage2",
+                         pairs=pairs, reference=reference, context_bank=bank)
+    for a, b in zip(history, serial_history):
+        for key in ("task", "dpo", "stability", "total_loss"):
+            assert a[key] == pytest.approx(b[key], abs=2e-6, rel=2e-5)
+    for (name, a), (_, b) in zip(model.named_parameters(), serial.named_parameters()):
+        torch.testing.assert_close(a, b, atol=3e-6, rtol=3e-5, msg=name)
     resumed = tiny_model(); resumed.load_trainable(stage1)
     fit(resumed, train, val, cfg2, root / "resumed", pairs=pairs, reference=reference,
         context_bank=bank, resume=root / "stage2/step_000001")
@@ -174,6 +183,6 @@ def test_mixed_batch_counts_only_real_approved_pairs(prepared):
     bank = ReviewedContexts(path, train)
     torch.set_num_threads(2)
     history = fit(tiny_model(), train, val, TrainConfig(stage=2, context_view_mode="reviewed_context",
-                  dpo_weight=0., accumulation=len(train), max_steps=1), root / "mixed", context_bank=bank)
+                  dpo_weight=0., accumulation=len(train), state_batch_size=2, max_steps=1), root / "mixed", context_bank=bank)
     assert history[0]["context_pairs"] == 1 and history[0]["unpaired_states"] == len(train)-1
     assert history[0]["valid_stab_suf"] == history[0]["valid_stab_rank"] == 1

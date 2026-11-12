@@ -19,6 +19,7 @@ class TrainConfig:
     stage: int = 1
     epochs: int = 1
     accumulation: int = 8
+    state_batch_size: int = 1  # Concurrent states; accumulation remains states per optimizer update.
     learning_rate: float = 2e-5
     head_learning_rate: float = 1e-4
     weight_decay: float = .01
@@ -84,7 +85,7 @@ def cache_reference(model, pairs, path):
 
 
 @torch.no_grad()
-def validate(model, examples):
+def validate(model, examples, batch_size=1):
     if not examples: raise ValueError("validation requires held-out task states")
     if any(x.split != "validation" for x in examples):
         raise ValueError("only validation data may guide training")
@@ -92,12 +93,15 @@ def validate(model, examples):
     sums = {"rank": 0., "suf": 0., "rel": 0.}; counts = dict.fromkeys(sums, 0)
     started = last = time.perf_counter()
     print(f"[validation] START {len(examples)} states; missing ranking labels stay unavailable", flush=True)
-    for index, x in enumerate(examples, 1):
-        components, n = task_loss([model(x.state)], [x.labels])
+    for start in range(0, len(examples), batch_size):
+        rows = examples[start:start+batch_size]
+        predictions = model.forward_batch([x.state for x in rows])
+        components, n = task_loss(predictions, [x.labels for x in rows])
         for key in sums:
             sums[key] += float(components[key]) * n[key]; counts[key] += n[key]
         now = time.perf_counter()
-        if index == 1 or index == len(examples) or now-last >= 5:
+        index = start + len(rows)
+        if start == 0 or index == len(examples) or now-last >= 5:
             print(f"[validation] {index}/{len(examples)} ETA={(now-started)/index*(len(examples)-index):.1f}s "
                   f"valid_counts={counts} peak_reserved_gib={memory_stats(model.device)['peak_reserved_gib']:.2f}", flush=True)
             last = now
@@ -109,7 +113,9 @@ def validate(model, examples):
 
 def fit(model, train, validation, config: TrainConfig, output, pairs=(), reference=None, resume=None,
         context_bank=None):
-    if config.stage not in (1, 2) or not train or config.accumulation < 1:
+    if (config.stage not in (1, 2) or not train or config.accumulation < 1
+            or isinstance(config.state_batch_size, bool) or not isinstance(config.state_batch_size, int)
+            or config.state_batch_size < 1 or config.state_batch_size > config.accumulation):
         raise ValueError("invalid training configuration or empty data")
     if any(x.split != "train" for x in train): raise ValueError("training input contains held-out data")
     if {x.state.group_id for x in train} & {x.state.group_id for x in validation}:
@@ -145,7 +151,9 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
     optimizer = torch.optim.AdamW(groups, weight_decay=config.weight_decay)
     windows = math.ceil(len(train) / config.accumulation)
     total = min(windows * config.epochs, config.max_steps or windows * config.epochs)
-    print(f"[train] {total} optimizer steps; accumulation={config.accumulation}; "
+    print(f"[train] {total} optimizer steps; effective_batch_states={config.accumulation}; "
+          f"state_batch_size={config.state_batch_size}; "
+          f"microbatches_per_update={math.ceil(config.accumulation/config.state_batch_size)}; "
           f"validate_every={config.validate_every}, save_every={config.save_every}; "
           f"memory_limit={memory_limit:.2f} GiB; output={output}", flush=True)
     start_step, history = 0, []
@@ -175,10 +183,11 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
         print(f"[checkpoint] Saved step {step}", flush=True)
 
     for step in range(start_step, total):
+        step_started = time.perf_counter()
         epoch, offset = divmod(step, windows)
         indices = list(range(len(train))); random.Random(config.seed + epoch).shuffle(indices)
         batch = [train[i] for i in indices[offset*config.accumulation:(offset+1)*config.accumulation]]
-        print(f"[train] START step {step+1}/{total}, epoch={epoch}, states={len(batch)}", flush=True)
+        print(f"[train] START step {step+1}/{total}, epoch={epoch+1}/{config.epochs}, states={len(batch)}", flush=True)
         last_notice = time.perf_counter()
         # Denominators span the effective batch, not microbatches with different
         # numbers of valid labels. Each term has its own valid-sample denominator.
@@ -205,36 +214,48 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                    context_over_budget=over_budget, unpaired_states=sum(v is None for v in secondary),
                    valid_stab_rank=stab_counts["rank"], valid_stab_suf=stab_counts["suf"])
         warmup = min(1., (step + 1) / max(1, config.stability_warmup_steps))
-        for state_index, (x, second_view) in enumerate(zip(batch, secondary), 1):
-            if state_index == 1 or time.perf_counter()-last_notice >= 30:
-                print(f"[train] step {step+1}/{total}, state {state_index}/{len(batch)}: "
-                      f"forward/backward K={len(x.state.candidates)}, id={x.state.question_id}", flush=True)
+        for start in range(0, len(batch), config.state_batch_size):
+            rows = batch[start:start+config.state_batch_size]
+            second_views = secondary[start:start+len(rows)]
+            stop = start + len(rows)
+            if start == 0 or time.perf_counter()-last_notice >= 30:
+                print(f"[train] step {step+1}/{total}, states {start+1}-{stop}/{len(batch)} together: "
+                      f"forward/backward K={[len(x.state.candidates) for x in rows]}", flush=True)
                 last_notice = time.perf_counter()
-            pa = model(x.state, View(0))
-            views = [pa]
-            if second_view is not None:
-                views.append(model(x.state, second_view))
-            loss = pa.log_h.sum() * 0.
-            for p in views:
-                c, n = task_loss([p], [x.labels])
-                for key, weight in (("rank", 1.), ("suf", 1.), ("rel", .2)):
-                    value = c[key] * n[key] / max(1, counts[key]) / len(views)
-                    loss = loss + weight * value; log[key] += float(value.detach())
-            if config.stage == 2 and config.stability_weight > 0 and second_view is not None:
-                # Compute the two masked means separately to preserve their distinct denominators.
-                pb = views[1]
-                if set(pa.candidate_ids) != set(pb.candidate_ids):
-                    raise ValueError("context view changed the effective candidate set")
-                if x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient and pa.candidate_ids:
-                    aligned = [pb.candidate_ids.index(eid) for eid in pa.candidate_ids]
-                    value = torch.relu(torch.linalg.vector_norm(pa.p - pb.p[aligned]) - config.tolerance).square() / max(1, stab_counts["rank"])
-                    loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
-                if x.labels.suf_valid and x.labels.gold_available:
-                    value = torch.relu(torch.abs(pa.h - pb.h) - config.tolerance).square() / max(1, stab_counts["suf"])
-                    loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
+            states, input_views = [], []
+            for x, second_view in zip(rows, second_views):
+                states.append(x.state); input_views.append(View(0))
+                if second_view is not None:
+                    states.append(x.state); input_views.append(second_view)
+            predictions = model.forward_batch(states, input_views)
+            cursor = 0
+            loss = predictions[0].log_h.sum() * 0.
+            for x, second_view in zip(rows, second_views):
+                view_count = 1 + int(second_view is not None)
+                views = predictions[cursor:cursor+view_count]
+                cursor += view_count
+                pa = views[0]
+                for p in views:
+                    c, n = task_loss([p], [x.labels])
+                    for key, weight in (("rank", 1.), ("suf", 1.), ("rel", .2)):
+                        value = c[key] * n[key] / max(1, counts[key]) / len(views)
+                        loss = loss + weight * value; log[key] += float(value.detach())
+                if config.stage == 2 and config.stability_weight > 0 and second_view is not None:
+                    # Separate valid-sample denominators still span the effective batch.
+                    pb = views[1]
+                    if set(pa.candidate_ids) != set(pb.candidate_ids):
+                        raise ValueError("context view changed the effective candidate set")
+                    if x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient and pa.candidate_ids:
+                        aligned = [pb.candidate_ids.index(eid) for eid in pa.candidate_ids]
+                        value = torch.relu(torch.linalg.vector_norm(pa.p - pb.p[aligned]) - config.tolerance).square() / max(1, stab_counts["rank"])
+                        loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
+                    if x.labels.suf_valid and x.labels.gold_available:
+                        value = torch.relu(torch.abs(pa.h - pb.h) - config.tolerance).square() / max(1, stab_counts["suf"])
+                        loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
+            # One backward for the shared microbatch graph; no per-state detach.
             loss.backward()
             if time.perf_counter()-last_notice >= 30:
-                print(f"[train] step {step+1}/{total}: completed state {state_index}/{len(batch)}; "
+                print(f"[train] step {step+1}/{total}: completed states {stop}/{len(batch)}; "
                       f"peak_reserved_gib={memory_stats(model.device)['peak_reserved_gib']:.2f}", flush=True)
                 last_notice = time.perf_counter()
         if use_dpo:
@@ -248,19 +269,23 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
         grad_norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], config.max_grad_norm)
         if not torch.isfinite(grad_norm): raise FloatingPointError("non-finite gradient; refusing optimizer update")
         optimizer.step(); synchronize(model.device)
+        step_seconds = time.perf_counter() - step_started
         elapsed = time.perf_counter() - started
         log.update(memory_stats(model.device), seconds=elapsed, eta_seconds=elapsed/(step-start_step+1)*(total-step-1),
-                   grad_norm=float(grad_norm), valid_rank=counts["rank"], valid_suf=counts["suf"], valid_rel=counts["rel"])
+                   grad_norm=float(grad_norm), valid_rank=counts["rank"], valid_suf=counts["suf"], valid_rel=counts["rel"],
+                   step_seconds=step_seconds, states_per_second=len(batch)/max(step_seconds, 1e-9))
         log["task"] = log["rank"] + log["suf"] + .2*log["rel"]
         log["total_loss"] = log["task"] + (config.dpo_weight*log["dpo"] + config.stability_weight*warmup*log["stability"] if config.stage == 2 else 0.)
         if log["peak_reserved_gib"] >= memory_limit:
             raise RuntimeError("measured memory exceeds budget; lower branch microbatch if above one or use a larger GPU; never split softmax")
-        print(f"[train] DONE step {step+1}/{total}: task={log['task']:.5f} rank={log['rank']:.5f} "
+        print(f"[train] DONE step {step+1}/{total}: epoch={epoch+1}/{config.epochs} "
+              f"loss={log['total_loss']:.5f} task={log['task']:.5f} rank={log['rank']:.5f} "
               f"suf={log['suf']:.5f} rel={log['rel']:.5f} valid_rank={counts['rank']} "
               f"grad_norm={float(grad_norm):.5f} peak_reserved_gib={log['peak_reserved_gib']:.2f} "
+              f"step_seconds={step_seconds:.1f} states/s={log['states_per_second']:.3f} "
               f"ETA={log['eta_seconds']:.1f}s (based on completed steps; validation/save time may add overhead)", flush=True)
         if (step+1) % config.validate_every == 0 or step+1 == total:
-            log.update(validate(model, validation))
+            log.update(validate(model, validation, batch_size=config.state_batch_size))
             log.update(memory_stats(model.device))
             elapsed = time.perf_counter() - started
             log.update(seconds=elapsed, eta_seconds=elapsed/(step-start_step+1)*(total-step-1))

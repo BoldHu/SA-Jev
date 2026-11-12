@@ -76,6 +76,14 @@
 
 ## 仍需在 Colab/真实服务运行
 
+2026-11-12 后续跨状态合批：新增 `SAJev.forward_batch`，充分性、Choice、相关性分别合批，按状态返回候选 ID 对齐的预测。训练/验证接入 `state_batch_size`，02/public 配置为 2；旧 `accumulation=8` 仍表示每次更新的有效状态数。两个状态及其合格视图组成一次计算图后共同反向，四个二状态 microbatch 后更新；DPO 仍按原轨迹与每 step 一对偏好执行。单状态/多状态的输出、全部梯度及有效标签加权后的优化器更新通过对比，涵盖不同 K、空候选、部分有效标签、末尾不足一批和跨状态输入隔离；Stage 2 混合双视图、DPO 与精确断点恢复也通过。此前记录的“多状态仍串行”仅适用于上一个版本。
+
+真实小型 Qwen3.5 + LoRA 在本地 CUDA 上复测两个不同状态，串行与跨状态合批的概率、损失、全部梯度在容差内一致（最大梯度绝对差约 `1.8e-8`），优化器更新通过；记录 `outputs/state_batching_check/cuda.json`。仍只验证了本地 Torch Delta 路径，不能代替真实 OpenJev-4B + FLA + A100 的吞吐和长输入显存试验。没有重建数据或运行正式训练。
+
+2026-11-12 独立判断合批：相关性 Noul 现在按长度排序后分组执行（默认最多 8 个判断），每行保持自己的选项掩码、Interactor 与归一化，结果恢复原候选顺序；充分性与完整 Choice 仍单独执行。输入 token 统计区分原逻辑 token 与合批 padding 后实际 token。02 设置默认分支 microbatch=2、6 步独立试跑；可在同样样本上测 4。新增 4 项检查覆盖概率/损失/全部梯度、不同 K 的独立归一化、输入隔离、顺序、token 统计和减少调用次数；与方法、训练进度、双视图/DPO/恢复及协议测试共 30 项通过，另修正 notebook 校验以接受用户保存的合法 `%pip` 单元后，其 1 项校验通过。9 个 notebook 格式有效，02 代码与生成器一致，用户历史输出保留。
+
+本地 RTX3050 上，真实随机小型 Qwen3.5 + PEFT（Torch Delta 内核）执行 `(branch, decision_batch)=(1,1)/(2,8)/(4,8)`，概率、损失和参与反传的全部梯度在容差内一致；合批的最大梯度绝对差约 `1.8e-8`，LoRA 和 Interactor 反传及优化器更新通过。记录：`outputs/decision_batching_check/cuda.json`。小模型计时含首次预热，不能作为速度倍数结论；未运行真实 4B + FLA 的合批 A100 性能/显存测试。多状态仍按梯度累积串行执行，未实现共享前缀训练、跨状态同时反向或自动最大 batch 搜索。无新训练数据、检索、API 调用或正式训练。
+
 2026-11-12：针对 Colab 预装 `torchao==0.10.0` 导致 PEFT 0.19.1 在创建 LoRA 时抛出 ImportError，所有 notebook 的 Colab 安装单元移除本项目不使用的 torchao 量化包。02 的小模型检查实时显示 stdout/stderr，并保存 `ROOT/qwen_lora_check.log`。本地 Conda SA-Jev（PEFT 0.19.1、Transformers 5.12.1、无 torchao）在 CPU 和 RTX3050 CUDA 上均通过原小模型的 LoRA/Interactor 反向传播及优化器更新检查，结果在 `outputs/torchao_fix_check/`；9 个 notebook 的格式和代码语法校验通过。这不代表 Colab Python 3.13、FLA 或真实 4B A100 训练已经通过，仍须在用户运行时复测。已有会话卸载 torchao 后应重启内核再从 02 的环境准备开始运行，避免已导入模块的可用性缓存残留。
 
 1. **OpenJev-4B 发布权重 + FLA 0.5.2 + A100**：代表性长状态/长轨迹的前向、反向、显存与吞吐；确认单卡峰值满足约束后才正式训练。
