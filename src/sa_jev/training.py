@@ -90,10 +90,17 @@ def validate(model, examples):
         raise ValueError("only validation data may guide training")
     mode = model.training; model.eval()
     sums = {"rank": 0., "suf": 0., "rel": 0.}; counts = dict.fromkeys(sums, 0)
-    for x in examples:
+    started = last = time.perf_counter()
+    print(f"[validation] START {len(examples)} states; missing ranking labels stay unavailable", flush=True)
+    for index, x in enumerate(examples, 1):
         components, n = task_loss([model(x.state)], [x.labels])
         for key in sums:
             sums[key] += float(components[key]) * n[key]; counts[key] += n[key]
+        now = time.perf_counter()
+        if index == 1 or index == len(examples) or now-last >= 5:
+            print(f"[validation] {index}/{len(examples)} ETA={(now-started)/index*(len(examples)-index):.1f}s "
+                  f"valid_counts={counts} peak_reserved_gib={memory_stats(model.device)['peak_reserved_gib']:.2f}", flush=True)
+            last = now
     model.train(mode)
     means = {k: sums[k] / counts[k] if counts[k] else None for k in sums}
     means["task"] = sum((means[k] or 0.) * w for k, w in (("rank", 1), ("suf", 1), ("rel", .2)))
@@ -118,10 +125,17 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
     if reviewed and context_bank is None:
         raise ValueError("Stage 2 requires a reviewed context bank; run prepare_context_views first")
     random.seed(config.seed); np.random.seed(config.seed); torch.manual_seed(config.seed)
+    memory_limit = config.memory_limit_gib
+    if model.device.type == "cuda":
+        total_gib = torch.cuda.get_device_properties(model.device).total_memory / 1024**3
+        memory_limit = min(memory_limit, total_gib - 2.)
+        print(f"[train] GPU total={total_gib:.2f} GiB; observed-memory stop threshold={memory_limit:.2f} GiB. "
+              "This check does not prevent an allocation from raising CUDA OOM.", flush=True)
     output = Path(output); output.mkdir(parents=True, exist_ok=True)
     if (output / "latest.json").exists() and resume is None:
         raise FileExistsError("run already has a checkpoint; use resume or a different output directory")
     write_json(output / "config.json", asdict(config))
+    print(f"[train] Binding data/config: train={len(train)}, validation={len(validation)}, stage={config.stage}", flush=True)
     binding = digest({"states": train, "validation": validation, "pairs": pairs, "config": asdict(config),
                       "context_bank": context_bank.binding if reviewed else None})
     groups = []
@@ -131,6 +145,9 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
     optimizer = torch.optim.AdamW(groups, weight_decay=config.weight_decay)
     windows = math.ceil(len(train) / config.accumulation)
     total = min(windows * config.epochs, config.max_steps or windows * config.epochs)
+    print(f"[train] {total} optimizer steps; accumulation={config.accumulation}; "
+          f"validate_every={config.validate_every}, save_every={config.save_every}; "
+          f"memory_limit={memory_limit:.2f} GiB; output={output}", flush=True)
     start_step, history = 0, []
     if resume:
         model.load_trainable(resume)
@@ -147,6 +164,7 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
 
     def save(step):
         checkpoint = output / f"step_{step:06d}"
+        print(f"[checkpoint] Saving step {step}: {checkpoint}", flush=True)
         model.save_trainable(checkpoint, {"stage": config.stage, "step": step, "data_binding": binding,
                              "reference_binding": reference["binding"] if use_dpo else None})
         torch.save({"optimizer": optimizer.state_dict(), "step": step, "binding": binding,
@@ -154,11 +172,14 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                     "torch_rng": torch.get_rng_state(), "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
                     "history": history}, checkpoint / "optimizer.pt")
         write_json(output / "latest.json", {"checkpoint": str(checkpoint.resolve()), "step": step})
+        print(f"[checkpoint] Saved step {step}", flush=True)
 
     for step in range(start_step, total):
         epoch, offset = divmod(step, windows)
         indices = list(range(len(train))); random.Random(config.seed + epoch).shuffle(indices)
         batch = [train[i] for i in indices[offset*config.accumulation:(offset+1)*config.accumulation]]
+        print(f"[train] START step {step+1}/{total}, epoch={epoch}, states={len(batch)}", flush=True)
+        last_notice = time.perf_counter()
         # Denominators span the effective batch, not microbatches with different
         # numbers of valid labels. Each term has its own valid-sample denominator.
         counts = {"rank": sum(x.labels.rank_valid for x in batch),
@@ -184,7 +205,11 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                    context_over_budget=over_budget, unpaired_states=sum(v is None for v in secondary),
                    valid_stab_rank=stab_counts["rank"], valid_stab_suf=stab_counts["suf"])
         warmup = min(1., (step + 1) / max(1, config.stability_warmup_steps))
-        for x, second_view in zip(batch, secondary):
+        for state_index, (x, second_view) in enumerate(zip(batch, secondary), 1):
+            if state_index == 1 or time.perf_counter()-last_notice >= 30:
+                print(f"[train] step {step+1}/{total}, state {state_index}/{len(batch)}: "
+                      f"forward/backward K={len(x.state.candidates)}, id={x.state.question_id}", flush=True)
+                last_notice = time.perf_counter()
             pa = model(x.state, View(0))
             views = [pa]
             if second_view is not None:
@@ -208,7 +233,12 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                     value = torch.relu(torch.abs(pa.h - pb.h) - config.tolerance).square() / max(1, stab_counts["suf"])
                     loss = loss + config.stability_weight * warmup * value; log["stability"] += float(value.detach())
             loss.backward()
+            if time.perf_counter()-last_notice >= 30:
+                print(f"[train] step {step+1}/{total}: completed state {state_index}/{len(batch)}; "
+                      f"peak_reserved_gib={memory_stats(model.device)['peak_reserved_gib']:.2f}", flush=True)
+                last_notice = time.perf_counter()
         if use_dpo:
+            print(f"[train] step {step+1}/{total}: full-trajectory DPO forward/backward", flush=True)
             pair = pairs[(step + config.seed) % len(pairs)]
             ref = reference["values"][pair.fingerprint]
             chosen = trajectory_log_probability(model, pair.chosen)
@@ -223,10 +253,19 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                    grad_norm=float(grad_norm), valid_rank=counts["rank"], valid_suf=counts["suf"], valid_rel=counts["rel"])
         log["task"] = log["rank"] + log["suf"] + .2*log["rel"]
         log["total_loss"] = log["task"] + (config.dpo_weight*log["dpo"] + config.stability_weight*warmup*log["stability"] if config.stage == 2 else 0.)
-        if log["peak_reserved_gib"] >= config.memory_limit_gib:
-            raise RuntimeError("measured memory exceeds budget; reduce branch microbatch or accumulation workload, never split softmax")
+        if log["peak_reserved_gib"] >= memory_limit:
+            raise RuntimeError("measured memory exceeds budget; lower branch microbatch if above one or use a larger GPU; never split softmax")
+        print(f"[train] DONE step {step+1}/{total}: task={log['task']:.5f} rank={log['rank']:.5f} "
+              f"suf={log['suf']:.5f} rel={log['rel']:.5f} valid_rank={counts['rank']} "
+              f"grad_norm={float(grad_norm):.5f} peak_reserved_gib={log['peak_reserved_gib']:.2f} "
+              f"ETA={log['eta_seconds']:.1f}s (based on completed steps; validation/save time may add overhead)", flush=True)
         if (step+1) % config.validate_every == 0 or step+1 == total:
             log.update(validate(model, validation))
+            log.update(memory_stats(model.device))
+            elapsed = time.perf_counter() - started
+            log.update(seconds=elapsed, eta_seconds=elapsed/(step-start_step+1)*(total-step-1))
+            if log["peak_reserved_gib"] >= memory_limit:
+                raise RuntimeError("validation exceeded the configured GPU memory budget")
         history.append(log); write_jsonl(output / "training.jsonl", history)
         print(log, flush=True)
         if (step+1) % config.save_every == 0 or step+1 == total: save(step+1)

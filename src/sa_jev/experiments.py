@@ -105,7 +105,8 @@ def load_method(root, config, method, seed):
     return model, "retrieval" if method == "retrieval_order" else "no_state_update" if method == "no_state_update" else "dynamic"
 
 
-def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resume=None, validation_limit=None):
+def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resume=None, validation_limit=None,
+                  output_directory=None):
     from .public_indexes import require_public_question_protocol
     require_public_question_protocol(root, config)
     if variant not in {"stage1", "full", "dpo", "stability", "small_stage1", "small_k"} and not variant.startswith("stab_weight_"):
@@ -120,10 +121,13 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
     if not audit.get("complete_scan"): raise ValueError("complete public OpenJevData audit is required before formal training")
     small = variant in {"small_stage1", "small_k"}
     suffix = "_small_k" if small else ""
+    print(f"[train] Reading {data/f'train_states{suffix}.jsonl'} and validation states...", flush=True)
     train = [TaskExample.from_dict(x) for x in read_jsonl(data/f"train_states{suffix}.jsonl")]
     val = [TaskExample.from_dict(x) for x in read_jsonl(data/"validation_states.jsonl")]
     if validation_limit: val = val[:validation_limit]
     if not val: raise ValueError("build retrieved validation pools and prepare_tasks before training")
+    print(f"[train] Loaded {len(train)} training states, {len(val)} validation states; "
+          f"valid rank train={sum(x.labels.rank_valid for x in train)}, val={sum(x.labels.rank_valid for x in val)}", flush=True)
     stage = 1 if variant in {"stage1", "small_stage1"} else 2
     cfg = TrainConfig(**config["training"], stage=stage, seed=seed, max_steps=max_steps)
     if variant == "dpo": cfg.stability_weight = 0.
@@ -134,7 +138,9 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
         from .context_views import ReviewedContexts
         context_bank = ReviewedContexts(data/f"training_contexts{suffix}.json", train,
                                         require_complete=max_steps is None)
-    output = root/f"runs/{variant}/seed_{seed}"
+    output = Path(output_directory) if output_directory is not None else root/f"runs/{variant}/seed_{seed}"
+    if (output / "latest.json").exists() and resume is None:
+        raise FileExistsError(f"Checkpoint already exists in {output}; use resume or a separate probe directory")
     environment_manifest(output/"environment.json", config)
     import random
     import numpy as np
@@ -146,8 +152,10 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
         if cfg.dpo_weight:
             pairs = [PreferencePair.from_dict(x) for x in read_jsonl(data/f"preferences{suffix}.jsonl")]
             reference = cache_reference(model, pairs, root/f"reference/seed_{seed}{suffix}.json")
-    history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume,
-                  context_bank=context_bank)
+    from .io import progress_phase
+    with progress_phase(f"[train] Stage {stage} run; progress below, output={output}"):
+        history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume,
+                      context_bank=context_bank)
     training_report(history, output)
     del model; gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
