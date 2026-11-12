@@ -47,6 +47,9 @@ subprocess.run([sys.executable, 'scripts/bootstrap_upstream.py'], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '-e', '.[train,retrieval,test]'], check=True)
 subprocess.run([sys.executable, '-m', 'pip', 'install', '--no-deps', '-e', 'vendor/OpenJev'], check=True)
 if 'google.colab' in sys.modules:
+    # BF16 + LoRA does not use torchao quantization. Colab's old optional
+    # torchao package makes PEFT 0.19.1 fail even on ordinary Linear layers.
+    subprocess.run([sys.executable, '-m', 'pip', 'uninstall', '-y', 'torchao'], check=True)
     subprocess.run([sys.executable, '-m', 'pip', 'install', 'fla-core==0.5.2'], check=True)
 # Activate editable-install .pth files in this already-running notebook kernel.
 import importlib, site
@@ -143,7 +146,30 @@ create('01_original_diagnostics.ipynb', '# 原模型诊断\n先测重复调用�
 ('code', "# Read-only audit. No model loading, API calls, or result-file modifications.\nimport json\nfrom collections import Counter\nexpected = DIAGNOSTIC_LIMIT\nreport_dir = ROOT / 'results' / 'efficiency' / 'openjev_frozen'\nfor k in efficiency_config['evaluation']['k_values']:\n    path = report_dir / f'K{k}' / 'raw.jsonl'\n    if not path.exists():\n        print(f'K={k}: MISSING {path}')\n        continue\n    with path.open(encoding='utf-8') as stream:\n        counts = Counter(json.loads(line).get('status', 'unknown') for line in stream if line.strip())\n    total = sum(counts.values())\n    print(f'K={k}: rows={total}, expected={expected}, status={dict(counts)}')\n    if total != expected:\n        print('WARNING: incomplete or overwritten results; do not report this as a completed full experiment.')\nmeta = report_dir / 'report_metadata.json'\nif meta.exists():\n    saved = json.loads(meta.read_text(encoding='utf-8'))\n    print('Summary rows:', saved.get('rows'), 'expected:', expected * len(efficiency_config['evaluation']['k_values']))\n")])
 
 create('02_stage1.ipynb', '# Stage 1 · 任务学习\n复用已训练 OpenJev-4B，BF16 骨干 + LoRA，FP32 原决策头与交互层。先实测单卡 pilot，再开始正式训练。', [
-('code', "import torch\nassert torch.cuda.is_available(), 'Select a GPU runtime'\nprint(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0).total_memory/1024**3, 'GiB')\nsubprocess.run([sys.executable, 'scripts/check_qwen_lora.py', '--device', 'cuda', '--output', str(ROOT/'qwen_lora_check.json')], check=True)"),
+('code', '''import torch
+assert torch.cuda.is_available(), 'Select a GPU runtime'
+print(torch.cuda.get_device_name(0), torch.cuda.get_device_properties(0).total_memory/1024**3, 'GiB')
+# Stream both output channels into the notebook and preserve the full traceback.
+log_path = ROOT / 'qwen_lora_check.log'
+cmd = [sys.executable, '-u', 'scripts/check_qwen_lora.py', '--device', 'cuda',
+       '--output', str(ROOT/'qwen_lora_check.json')]
+print('Tiny random model check (no downloads). Log:', log_path, flush=True)
+with log_path.open('w', encoding='utf-8') as log:
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                          text=True, encoding='utf-8', errors='replace', bufsize=1) as process:
+        try:
+            for line in process.stdout:
+                print(line, end='', flush=True)
+                log.write(line)
+                log.flush()
+            returncode = process.wait()
+        except KeyboardInterrupt:
+            process.terminate()
+            process.wait()
+            raise
+if returncode:
+    raise RuntimeError(f'Qwen LoRA check failed (exit {returncode}); see traceback above or {log_path}')
+'''),
 ('code', "# Reuse full prepared data. This switch controls training, not the data directory.\nimport copy, importlib, torch\nfrom sa_jev import training, experiments\nfor module in (training, experiments):\n    importlib.reload(module)\nRUN_FULL_STAGE1 = False\nPROBE_STEPS = 20\nTRAIN_SEEDS = [17]  # After seed 17 completes, run [29, 43] for the remaining formal seeds.\nassert torch.cuda.is_available(), 'Select an A100 GPU runtime'\nGPU_GIB = torch.cuda.get_device_properties(0).total_memory / 1024**3\nconfig['model']['branch_microbatch'] = 1\nconfig['training']['memory_limit_gib'] = min(38.0, GPU_GIB - 2.0)\n# Accumulation keeps one task state's graph at a time; retain the effective batch.\nconfig['training']['accumulation'] = 8\nprint('Data ROOT:', ROOT, flush=True)\nprint('GPU:', torch.cuda.get_device_name(0), 'capacity GiB:', round(GPU_GIB, 2), flush=True)\nprint('Native BF16:', torch.cuda.is_bf16_supported(including_emulation=False), flush=True)\nprint('Memory stop threshold GiB:', config['training']['memory_limit_gib'], flush=True)\nprint('Mode:', 'formal Stage 1' if RUN_FULL_STAGE1 else '20-step probe in a separate directory', flush=True)\n"),
 ('code', "from datetime import datetime, timezone\nfrom uuid import uuid4\nfrom sa_jev.experiments import train_variant\nstage1_config = copy.deepcopy(config)\nif not RUN_FULL_STAGE1:\n    stage1_config['training']['validate_every'] = 10\n    stage1_config['training']['save_every'] = 10\nprobe_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_' + uuid4().hex[:6]\nfor seed in (TRAIN_SEEDS if RUN_FULL_STAGE1 else [17]):\n    probe_output = None if RUN_FULL_STAGE1 else ROOT / 'runs' / 'stage1_probe' / probe_id / f'seed_{seed}'\n    history = train_variant(\n        ROOT, stage1_config, 'stage1', seed,\n        max_steps=None if RUN_FULL_STAGE1 else PROBE_STEPS,\n        validation_limit=None if RUN_FULL_STAGE1 else 6,\n        output_directory=probe_output,\n    )\n    print('Finished steps:', len(history),\n          'peak reserved GiB:', max(row['peak_reserved_gib'] for row in history),\n          'total valid rank observations:', sum(row['valid_rank'] for row in history), flush=True)\n    if probe_output is not None:\n        print('Probe saved separately:', probe_output, flush=True)\n"),
 ('md', '检查 training.csv/PNG/PDF、验证 loss、实际显存和 ETA。4GB 本地 tiny 测试不能代替 4B A100 测试；OOM 时降低 branch_microbatch，不切分 softmax，不截断证据，不改变标签。恢复训练使用 train_variant(..., resume=checkpoint_path)。')])

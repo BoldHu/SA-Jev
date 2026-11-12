@@ -76,6 +76,8 @@
 
 ## 仍需在 Colab/真实服务运行
 
+2026-11-12：针对 Colab 预装 `torchao==0.10.0` 导致 PEFT 0.19.1 在创建 LoRA 时抛出 ImportError，所有 notebook 的 Colab 安装单元移除本项目不使用的 torchao 量化包。02 的小模型检查实时显示 stdout/stderr，并保存 `ROOT/qwen_lora_check.log`。本地 Conda SA-Jev（PEFT 0.19.1、Transformers 5.12.1、无 torchao）在 CPU 和 RTX3050 CUDA 上均通过原小模型的 LoRA/Interactor 反向传播及优化器更新检查，结果在 `outputs/torchao_fix_check/`；9 个 notebook 的格式和代码语法校验通过。这不代表 Colab Python 3.13、FLA 或真实 4B A100 训练已经通过，仍须在用户运行时复测。已有会话卸载 torchao 后应重启内核再从 02 的环境准备开始运行，避免已导入模块的可用性缓存残留。
+
 1. **OpenJev-4B 发布权重 + FLA 0.5.2 + A100**：代表性长状态/长轨迹的前向、反向、显存与吞吐；确认单卡峰值满足约束后才正式训练。
 2. 完整 8k/4k 数据准备、全部 OpenJevData 扫描、实际 K/有效监督覆盖核查；必要时对未知候选补可核验注释。本地 BGE 分别搭配真实 DeepSeek、Gemini 的微型 LightRAG 全链路已通过；仍需在真实 pilot 语料上测量召回覆盖、建图耗时和 API 成本。
 3. 官方 Jev API、真实回答模型的正式数据测量；最终采用的 AutoDL DeepSeek 已完成最后一次聊天及小规模建图复测，向量使用本地编码器。此前 Google Gemini 的接口验证保留为历史记录。未读取或使用 `JEV_API_KEY.txt`，也未调用官方 Jev API。
