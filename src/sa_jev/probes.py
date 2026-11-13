@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import gc
+import math
 import random
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -52,14 +54,22 @@ def prepare_stage2_probe(root, config, output, stage1_checkpoint, *, question_li
     if (output/'latest.json').exists():
         raise FileExistsError('This probe already trained; rerun the settings cell for a new isolated directory')
     # Review only questions for which a real, already-created preference pair exists.
-    ids = []
+    ids, available = [], {}
     for raw in read_jsonl(root/'data/preferences.jsonl'):
         pair = PreferencePair.from_dict(raw)
         qid = pair.chosen.initial.question_id
-        if qid not in ids:
-            ids.append(qid)
-        if len(ids) == question_limit:
-            break
+        available.setdefault(qid, pair.chosen.initial)
+    # Keep the first previously reviewed questions, then include high K and long
+    # evidence. This is a stress/procedure sample, not a representative QA score.
+    ordered = list(available)
+    def add(qid):
+        if len(ids) < question_limit and qid not in ids: ids.append(qid)
+    for qid in ordered[:min(4, question_limit)]: add(qid)
+    if available:
+        add(max(available, key=lambda q: len(available[q].candidates)))
+        add(max(available, key=lambda q: max((len(e.text) for e in available[q].candidates), default=0)))
+    random.Random(17).shuffle(ordered)
+    for qid in ordered: add(qid)
     if not ids:
         raise ValueError('No real trajectory preferences available; do not synthesize a preference to pass the probe')
     print(f'[stage2 probe] Reviewing at most {len(ids)} training questions; no retrieval or trajectory regeneration.', flush=True)
@@ -74,7 +84,7 @@ def prepare_stage2_probe(root, config, output, stage1_checkpoint, *, question_li
 
 
 def run_stage2_probe(root, config, output, stage1_checkpoint, *, max_steps=2, pair_limit=2,
-                     validation_limit=2, seed=17):
+                     validation_limit=2, seed=17, stress_check=False):
     from .experiments import environment_manifest
     from .reporting import training_report
     root, output, checkpoint = _check_sources(root, config, output, stage1_checkpoint)
@@ -84,7 +94,9 @@ def run_stage2_probe(root, config, output, stage1_checkpoint, *, max_steps=2, pa
         raise FileExistsError('Completed probe exists; use a new probe directory, not the formal run directory')
     all_train = [TaskExample.from_dict(x) for x in read_jsonl(root/'data/train_states.jsonl')]
     bank = ReviewedContexts(output/'training_contexts.json', all_train, require_complete=False)
-    train = [x for x in all_train if digest(x) in bank.rows]
+    plan = read_json(output/'probe_plan.json')
+    # Preserve rejected/unpaired states too, just as formal training does.
+    train = [x for x in all_train if x.state.question_id in plan['question_ids']]
     del all_train
     if not train:
         raise ValueError('No audited task states available for the probe')
@@ -105,6 +117,11 @@ def run_stage2_probe(root, config, output, stage1_checkpoint, *, max_steps=2, pa
         if len(val) == validation_limit:
             break
     cfg = TrainConfig(**config['training'], stage=2, seed=seed, max_steps=max_steps)
+    windows = math.ceil(len(train)/cfg.accumulation)
+    cfg = replace(cfg, epochs=max(cfg.epochs, math.ceil(max_steps/windows)))
+    if cfg.epochs > 1:
+        print(f'[stage2 probe] Repeating the small probe subset for {cfg.epochs} epochs to measure '
+              'the requested updates; this is not a representative full-data epoch.', flush=True)
     if cfg.context_view_mode != 'reviewed_context' or cfg.dpo_weight <= 0 or cfg.stability_weight <= 0:
         raise ValueError('Full Stage-2 probe must exercise reviewed-context views, DPO and stability')
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
@@ -118,9 +135,18 @@ def run_stage2_probe(root, config, output, stage1_checkpoint, *, max_steps=2, pa
     model = SAJev.from_pretrained(**config['model'], trainable=True)
     try:
         model.load_trainable(checkpoint)
-        reference = cache_reference(model, pairs, output/'reference.json')
+        if stress_check:
+            from .performance import stress_probe
+            stress_probe(model, train, cfg, output, bank, pairs)
+        reference = cache_reference(model, pairs, output/'reference.json', cfg.state_batch_size)
         history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, context_bank=bank)
         training_report(history, output)
+        from .performance import throughput_report
+        manifest = read_json(root/'data/task_manifest.json') if (root/'data/task_manifest.json').exists() else {}
+        throughput_report(history, output, stage=2, training_states=manifest.get('task_states', 36000),
+                          effective_batch=cfg.accumulation, epochs=config['training'].get('epochs', 1),
+                          validate_every=config['training'].get('formal_validate_every', 500),
+                          reference=reference, reference_pairs=manifest.get('preferences', 3000))
         checks = {'purpose': 'pipeline_smoke_only_not_paper_results',
                   'completed_updates': len(history), 'dpo_finite': all(np.isfinite(h['dpo']) for h in history),
                   'context_pairs': sum(h['context_pairs'] for h in history),

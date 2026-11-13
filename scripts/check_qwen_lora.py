@@ -21,7 +21,8 @@ from sa_jev.losses import task_loss
 from sa_jev.io import write_json
 
 
-def check(device="cpu", output="outputs/qwen_lora_check.json", compare_batching=False):
+def check(device="cpu", output="outputs/qwen_lora_check.json", compare_batching=False,
+          compare_execution=False, dtype='float32'):
     torch.set_num_threads(2); torch.manual_seed(17)
     config = Qwen3_5TextConfig(vocab_size=2048, hidden_size=32, intermediate_size=64,
         num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2, head_dim=8,
@@ -31,10 +32,76 @@ def check(device="cpu", output="outputs/qwen_lora_check.json", compare_batching=
     backbone = get_peft_model(Qwen3_5TextModel(config), LoraConfig(**lora))
     core = OpenJevDecisionModel(Qwen35Adapter(backbone), DecisionHead(32, set_dim=32, set_heads=4,
                                set_layers=1, ffn_dim=64), branch_microbatch_size=1, checkpoint_branches=True).to(device)
+    if dtype == 'bfloat16':
+        core.adapter.to(dtype=torch.bfloat16)  # Native head stays FP32, as in the real artifact.
     tokenizer = TinyTokenizer(); model = SAJev(core, tokenizer, DecisionSerializer(tokenizer),
                                               base_identity="TEST_ONLY_tiny_Qwen3.5", lora_config=lora)
     q = fixture_questions()[0]; state = State(q.id,q.group_id,q.question,Pool(q.id,q.evidence[:3],"fixture"),budget=3)
     comparison = None
+    execution_comparison = None
+    if compare_execution:
+        from sa_jev.execution import configure_checkpointing
+        from sa_jev.prompts import View
+        from sa_jev.data import task_states
+        from sa_jev.training import task_predictions
+        from sa_jev.trajectories import build_preferences, trajectory_log_probabilities
+        from sa_jev.losses import stability_loss, dpo_loss
+        examples = task_states(q, state.pool)
+        states = [x.state for x in examples]
+        labels = [x.labels for x in examples]
+        pairs = build_preferences([q], [examples[0].state], limit=1)
+        # Exercise nonzero LoRA A/B gradients as in an already-trained checkpoint.
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if 'lora_B' in name: parameter.normal_(std=.01)
+        baseline = None; measures = []
+        for optimized, mode in ((False, 'branch'), (True, 'branch'), (True, 'layer'), (True, 'branch_layer')):
+            model.optimized_execution = optimized
+            model.branch_token_budget = 600
+            core.branch_microbatch_size = 2
+            configure_checkpointing(core, mode)
+            model.train(); model.zero_grad(set_to_none=True); model.reset_execution_stats()
+            if str(device).startswith('cuda'): torch.cuda.synchronize()
+            started = perf_counter()
+            expanded = [x for x in examples for _ in range(2)]
+            views = [v for x in examples for v in (View(), View(0, 'Unrelated background.'))]
+            needed = [bool(x.labels.gold_available and x.labels.suf_valid and not x.labels.sufficient) for x in expanded]
+            predictions = task_predictions(model, expanded, views, needed)
+            values, _ = task_loss(predictions, [x.labels for x in expanded])
+            stability = stability_loss(predictions[::2], predictions[1::2], labels, states, states)[0]
+            chosen, rejected = trajectory_log_probabilities(model, (pairs[0].chosen, pairs[0].rejected), 2)
+            dpo = dpo_loss(chosen, rejected, chosen.new_tensor(-3.), chosen.new_tensor(-4.))
+            loss = values['task'] + .1*stability + .2*dpo
+            loss.backward()
+            if str(device).startswith('cuda'): torch.cuda.synchronize()
+            tensors = torch.stack([values['task'], stability, dpo, loss, chosen, rejected]).detach().float()
+            gradient = {n: p.grad.detach().float().clone() for n,p in model.named_parameters() if p.grad is not None}
+            error = relative = 0.
+            if baseline is None:
+                baseline = tensors, gradient
+            else:
+                bf16 = dtype == 'bfloat16'
+                torch.testing.assert_close(tensors, baseline[0], atol=.003 if bf16 else 2e-5,
+                                           rtol=.003 if bf16 else 2e-4)
+                assert gradient.keys() == baseline[1].keys()
+                total_error = total_norm = 0.
+                for name in gradient:
+                    delta = gradient[name]-baseline[1][name]
+                    error = max(error, float(delta.abs().max()))
+                    total_error += float(delta.square().sum())
+                    total_norm += float(baseline[1][name].square().sum())
+                    if not bf16:
+                        torch.testing.assert_close(gradient[name], baseline[1][name], atol=2e-5, rtol=2e-3, msg=name)
+                    assert torch.isfinite(gradient[name]).all(), name
+                relative = (total_error/max(total_norm, 1e-30))**.5
+                assert relative < (.03 if bf16 else .003), f'Gradient relative L2 error: {relative}'
+            measures.append(dict(optimized=optimized, checkpoint_mode=mode, seconds=perf_counter()-started,
+                                 max_gradient_abs_error=error, relative_gradient_l2_error=relative,
+                                 execution=dict(model.execution_stats)))
+            print('[execution check]', measures[-1], flush=True)
+        execution_comparison = {'passed': True, 'dtype': dtype, 'measurements': measures,
+                                'scope': 'tiny random Qwen3.5 loss/gradient check; not 4B performance'}
+        configure_checkpointing(core, 'branch'); model.zero_grad(set_to_none=True)
     if compare_batching:
         measurements = []
         baseline = None
@@ -90,11 +157,13 @@ def check(device="cpu", output="outputs/qwen_lora_check.json", compare_batching=
             "parameters":sum(p.numel() for p in model.parameters()), "trained_OpenJev4B":False,
             "delta_kernel": next((f'{m.chunk_gated_delta_rule.__module__}.{m.chunk_gated_delta_rule.__name__}'
                                   for m in model.modules() if hasattr(m, 'chunk_gated_delta_rule')), None),
-            "batching_comparison": comparison}
+            "batching_comparison": comparison, 'execution_comparison': execution_comparison}
     write_json(output,result); print(result)
 
 
 if __name__ == "__main__":
     p=argparse.ArgumentParser();p.add_argument("--device",default="cpu");p.add_argument("--output",default="outputs/qwen_lora_check.json")
     p.add_argument('--compare-batching', action='store_true')
-    args=p.parse_args();check(args.device,args.output,args.compare_batching)
+    p.add_argument('--compare-execution', action='store_true')
+    p.add_argument('--dtype', choices=['float32', 'bfloat16'], default='float32')
+    args=p.parse_args();check(args.device,args.output,args.compare_batching,args.compare_execution,args.dtype)

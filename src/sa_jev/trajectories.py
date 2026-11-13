@@ -82,6 +82,44 @@ def trajectory_log_probability(model, trajectory):
     return torch.stack(values).sum()  # no length normalization
 
 
+def trajectory_log_probabilities(model, trajectories, state_batch_size=1):
+    """Exact clean trajectory scoring; share common states only within this call.
+
+    STOP needs h only. READ still needs the full remaining-candidate softmax.
+    Replayed states/labels/actions are not changed; duplicate actions contribute
+    repeatedly through the same graph. No inference cache is used in training.
+    """
+    from .execution import deterministic_forward
+    if not getattr(model, 'optimized_execution', False) or not deterministic_forward(model):
+        return [trajectory_log_probability(model, t) for t in trajectories]
+    if state_batch_size < 1: raise ValueError('state_batch_size must be positive')
+    states, needed, indices, keys = [], [], [], {}
+    for trajectory in trajectories:
+        replay, _ = trajectory.replay()
+        actions = []
+        for state, action in replay:
+            key = digest(state)
+            if key not in keys:
+                keys[key] = len(states); states.append(state); needed.append(False)
+            index = keys[key]
+            needed[index] |= action != 'STOP'
+            actions.append((index, action))
+        indices.append(actions)
+    predictions = []
+    for start in range(0, len(states), state_batch_size):
+        predictions.extend(model.forward_batch(states[start:start+state_batch_size], include_rel=False,
+                            choice_needed=needed[start:start+state_batch_size]))
+    result = []
+    for actions in indices:
+        values = []
+        for index, action in actions:
+            p = predictions[index]
+            values.append(p.log_h[1] if action == 'STOP' else
+                          p.log_h[0] + p.log_p[p.candidate_ids.index(action)])
+        result.append(torch.stack(values).sum() if values else next(model.parameters()).sum()*0.)
+    return result
+
+
 def _rollout(q, initial, mode, rng):
     state, actions = initial, []
     while state.budget and state.candidates:

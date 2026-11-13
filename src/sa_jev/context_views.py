@@ -81,6 +81,7 @@ class ContextReviewer:
             "object with these boolean keys: " + ", ".join(CHECKS) +
             "; also confidence ('high' or 'uncertain') and a short concrete rationale."
         )
+        system = getattr(self, "system_prompt", system)
         response = self.client.chat.completions.create(
             model=self.model, temperature=0, max_tokens=self.max_tokens,
             **({"extra_body": self.extra_body} if self.extra_body else {}),

@@ -8,10 +8,10 @@ import random
 import time
 import torch
 import numpy as np
-from .io import digest, read_json, write_json, write_jsonl
+from .io import canonical, digest, read_json, write_json, write_jsonl
 from .losses import task_loss, stability_loss, dpo_loss
 from .prompts import View
-from .trajectories import trajectory_log_probability
+from .trajectories import trajectory_log_probability, trajectory_log_probabilities
 
 
 @dataclass
@@ -61,27 +61,49 @@ def model_fingerprint(model):
     return h.hexdigest()
 
 
-def cache_reference(model, pairs, path):
+def cache_reference(model, pairs, path, state_batch_size=1):
     identity = model_fingerprint(model)
-    binding = digest({"model": identity, "pairs": [p.fingerprint for p in pairs],
+    pair_keys = [p.fingerprint for p in pairs]
+    binding = digest({"model": identity, "pairs": pair_keys,
                       "view": 0, "probability": "sum_READ_and_autonomous_STOP_v1"})
     path = Path(path)
+    values = {}
     if path.exists():
         cache = read_json(path)
         if cache["binding"] != binding: raise ValueError("stale Stage-1 reference cache")
-        return cache
+        values = cache['values']
+        if all(key in values for key in pair_keys): return cache
     training = model.training; model.eval()
-    values, started = {}, time.perf_counter()
-    with torch.no_grad():
-        for i, pair in enumerate(pairs):
-            values[pair.fingerprint] = [float(trajectory_log_probability(model, t)) for t in (pair.chosen, pair.rejected)]
-            if i % 10 == 0 or i == len(pairs) - 1:
-                elapsed = time.perf_counter() - started
-                print(f"reference {i+1}/{len(pairs)} ETA={elapsed/(i+1)*(len(pairs)-i-1):.1f}s", flush=True)
-    model.train(training)
+    started = time.perf_counter(); computed = 0
+    pending = sum(key not in values for key in pair_keys)
     cache = {"binding": binding, "stage1_fingerprint": identity, "values": values}
-    write_json(path, cache)
+    try:
+        with torch.no_grad():
+            for i, (pair, key) in enumerate(zip(pairs, pair_keys)):
+                if key not in values:
+                    values[key] = [float(x) for x in trajectory_log_probabilities(
+                        model, (pair.chosen, pair.rejected), state_batch_size)]
+                    computed += 1
+                    pending -= 1
+                if i % 10 == 0 or i == len(pairs) - 1:
+                    elapsed = time.perf_counter() - started
+                    cache.update(new_pairs=computed, compute_seconds=elapsed)
+                    write_json(path, cache)  # Atomic; completed references survive interruption.
+                    print(f"reference {i+1}/{len(pairs)} ETA={elapsed/max(1,computed)*pending:.1f}s", flush=True)
+    finally:
+        model.train(training)
     return cache
+
+
+def task_predictions(model, examples, views=None, stability_needed=None):
+    """Prune only branches with exactly zero use in the current objective."""
+    from .execution import deterministic_forward
+    kwargs = {}
+    if getattr(model, 'optimized_execution', False) and deterministic_forward(model):
+        stability_needed = stability_needed or [False]*len(examples)
+        kwargs = {'choice_needed': [x.labels.rank_valid or stable for x, stable in zip(examples, stability_needed)],
+                  'relevance_masks': [x.labels.rel_valid for x in examples]}
+    return model.forward_batch([x.state for x in examples], views, **kwargs)
 
 
 @torch.no_grad()
@@ -95,7 +117,7 @@ def validate(model, examples, batch_size=1):
     print(f"[validation] START {len(examples)} states; missing ranking labels stay unavailable", flush=True)
     for start in range(0, len(examples), batch_size):
         rows = examples[start:start+batch_size]
-        predictions = model.forward_batch([x.state for x in rows])
+        predictions = task_predictions(model, rows)
         components, n = task_loss(predictions, [x.labels for x in rows])
         for key in sums:
             sums[key] += float(components[key]) * n[key]; counts[key] += n[key]
@@ -108,7 +130,8 @@ def validate(model, examples, batch_size=1):
     model.train(mode)
     means = {k: sums[k] / counts[k] if counts[k] else None for k in sums}
     means["task"] = sum((means[k] or 0.) * w for k, w in (("rank", 1), ("suf", 1), ("rel", .2)))
-    return {"validation": means, "validation_valid_counts": counts}
+    return {"validation": means, "validation_valid_counts": counts,
+            "validation_seconds": time.perf_counter()-started, 'validation_states': len(examples)}
 
 
 def fit(model, train, validation, config: TrainConfig, output, pairs=(), reference=None, resume=None,
@@ -169,6 +192,10 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
     model.train()
     if model.device.type == "cuda": torch.cuda.reset_peak_memory_stats(model.device)
     started = time.perf_counter()
+    # On resume discard log rows beyond the restored checkpoint (including a
+    # possible interrupted final append). Checkpoints, not log tails, define state.
+    write_jsonl(output / 'training.jsonl', history)
+    shuffled_epoch, indices = None, None
 
     def save(step):
         checkpoint = output / f"step_{step:06d}"
@@ -184,8 +211,11 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
 
     for step in range(start_step, total):
         step_started = time.perf_counter()
+        if hasattr(model, 'reset_execution_stats'): model.reset_execution_stats()
         epoch, offset = divmod(step, windows)
-        indices = list(range(len(train))); random.Random(config.seed + epoch).shuffle(indices)
+        if shuffled_epoch != epoch:
+            indices = list(range(len(train))); random.Random(config.seed + epoch).shuffle(indices)
+            shuffled_epoch = epoch
         batch = [train[i] for i in indices[offset*config.accumulation:(offset+1)*config.accumulation]]
         print(f"[train] START step {step+1}/{total}, epoch={epoch+1}/{config.epochs}, states={len(batch)}", flush=True)
         last_notice = time.perf_counter()
@@ -209,7 +239,9 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
             "suf": sum(v is not None and x.labels.suf_valid and x.labels.gold_available for x, v in zip(batch, secondary))}
         optimizer.zero_grad(set_to_none=True)
         log = {"step": step + 1, "epoch": epoch, "rank": 0., "suf": 0., "rel": 0., "dpo": 0., "stability": 0.}
-        log.update(paired_states=sum(v is not None for v in secondary),
+        log.update(batch_states=len(batch), min_k=min(len(x.state.candidates) for x in batch),
+                   max_k=max(len(x.state.candidates) for x in batch),
+                   paired_states=sum(v is not None for v in secondary),
                    context_pairs=sum(bool(v and v.context_suffix) for v in secondary),
                    context_over_budget=over_budget, unpaired_states=sum(v is None for v in secondary),
                    valid_stab_rank=stab_counts["rank"], valid_stab_suf=stab_counts["suf"])
@@ -222,12 +254,15 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                 print(f"[train] step {step+1}/{total}, states {start+1}-{stop}/{len(batch)} together: "
                       f"forward/backward K={[len(x.state.candidates) for x in rows]}", flush=True)
                 last_notice = time.perf_counter()
-            states, input_views = [], []
+            examples, input_views, need_stability = [], [], []
             for x, second_view in zip(rows, second_views):
-                states.append(x.state); input_views.append(View(0))
+                stable = bool(config.stage == 2 and config.stability_weight > 0 and second_view is not None
+                              and x.labels.suf_valid and x.labels.gold_available and not x.labels.sufficient
+                              and x.labels.candidate_ids)
+                examples.append(x); input_views.append(View(0)); need_stability.append(stable)
                 if second_view is not None:
-                    states.append(x.state); input_views.append(second_view)
-            predictions = model.forward_batch(states, input_views)
+                    examples.append(x); input_views.append(second_view); need_stability.append(stable)
+            predictions = task_predictions(model, examples, input_views, need_stability)
             cursor = 0
             loss = predictions[0].log_h.sum() * 0.
             for x, second_view in zip(rows, second_views):
@@ -258,14 +293,20 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
                 print(f"[train] step {step+1}/{total}: completed states {stop}/{len(batch)}; "
                       f"peak_reserved_gib={memory_stats(model.device)['peak_reserved_gib']:.2f}", flush=True)
                 last_notice = time.perf_counter()
+        synchronize(model.device)
+        task_seconds = time.perf_counter()-step_started
+        dpo_started = time.perf_counter()
         if use_dpo:
             print(f"[train] step {step+1}/{total}: full-trajectory DPO forward/backward", flush=True)
             pair = pairs[(step + config.seed) % len(pairs)]
             ref = reference["values"][pair.fingerprint]
-            chosen = trajectory_log_probability(model, pair.chosen)
-            rejected = trajectory_log_probability(model, pair.rejected)
+            chosen, rejected = trajectory_log_probabilities(model, (pair.chosen, pair.rejected), config.state_batch_size)
             value = dpo_loss(chosen, rejected, chosen.new_tensor(ref[0]), chosen.new_tensor(ref[1]), config.beta)
             (config.dpo_weight * value).backward(); log["dpo"] = float(value.detach())
+        synchronize(model.device)
+        log['task_seconds'] = task_seconds
+        log['dpo_seconds'] = time.perf_counter()-dpo_started if use_dpo else 0.
+        log['execution'] = dict(getattr(model, 'execution_stats', {}))
         grad_norm = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], config.max_grad_norm)
         if not torch.isfinite(grad_norm): raise FloatingPointError("non-finite gradient; refusing optimizer update")
         optimizer.step(); synchronize(model.device)
@@ -291,7 +332,11 @@ def fit(model, train, validation, config: TrainConfig, output, pairs=(), referen
             log.update(seconds=elapsed, eta_seconds=elapsed/(step-start_step+1)*(total-step-1))
             if log["peak_reserved_gib"] >= memory_limit:
                 raise RuntimeError("validation exceeded the configured GPU memory budget")
-        history.append(log); write_jsonl(output / "training.jsonl", history)
+        history.append(log)
+        # Avoid rewriting an ever-growing history on Drive after every update.
+        # A fresh/resumed run publishes its known history once above.
+        with (output / 'training.jsonl').open('a', encoding='utf-8') as stream:
+            stream.write(canonical(log) + '\n')
         print(log, flush=True)
         if (step+1) % config.save_every == 0 or step+1 == total: save(step+1)
     return history

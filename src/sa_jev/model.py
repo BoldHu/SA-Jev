@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import hashlib
+import json
 import re
 import torch
 from torch import nn
@@ -29,7 +30,7 @@ class Prediction:
 
 class SAJev(nn.Module):
     def __init__(self, core, tokenizer, serializer, *, temperature=1., base_identity="", lora_config=None,
-                 decision_batch_size=8):
+                 decision_batch_size=8, optimized_execution=False, branch_token_budget=0):
         super().__init__()
         if isinstance(decision_batch_size, bool) or not isinstance(decision_batch_size, int) or decision_batch_size < 1:
             raise ValueError("decision_batch_size must be a positive integer")
@@ -38,6 +39,15 @@ class SAJev(nn.Module):
         self.base_identity = base_identity
         self.lora_config = lora_config
         self.decision_batch_size = decision_batch_size
+        if isinstance(branch_token_budget, bool) or not isinstance(branch_token_budget, int) or branch_token_budget < 0:
+            raise ValueError('branch_token_budget must be a nonnegative integer')
+        self.optimized_execution = optimized_execution
+        self.branch_token_budget = branch_token_budget
+        self.execution_stats = {}
+
+    def reset_execution_stats(self):
+        self.execution_stats = dict(requested_decisions=0, unique_decisions=0, encoded_branches=0,
+                                    forward_padded_tokens=0, backbone_calls=0, max_branch_tokens=0)
 
     @property
     def device(self): return next(self.parameters()).device
@@ -66,32 +76,66 @@ class SAJev(nn.Module):
         """
         from openjev.api.typesafe import parse_request
         from openjev.data.collator import collate_serialized
-        encoded = []
+        from .execution import deterministic_forward, score_bucketed
+        optimized = self.optimized_execution and deterministic_forward(self)
+        bodies = list(bodies)
+        if not self.execution_stats:
+            self.reset_execution_stats()
+        self.execution_stats['requested_decisions'] += len(bodies)
+        unique, mapping, keys = [], [], {}
         for body in bodies:
+            key = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(',', ':')) if optimized else len(unique)
+            if key not in keys:
+                keys[key] = len(unique); unique.append(body)
+            mapping.append(keys[key])
+        self.execution_stats['unique_decisions'] += len(unique)
+        encoded = []
+        for body in unique:
             parsed = parse_request(body, model_ids=set())
             if len(parsed) != 1:
                 raise ValueError("one complete decision per request")
             encoded.append(self.serializer(parsed[0].decision))
+        if encoded:
+            self.execution_stats['max_branch_tokens'] = max(self.execution_stats['max_branch_tokens'],
+                max(len(branch.input_ids) for item in encoded for branch in item.branches))
         pad = self.tokenizer.pad_token_id
         if pad is None: pad = self.tokenizer.eos_token_id
         order = sorted(range(len(encoded)), key=lambda i: max(len(b.input_ids) for b in encoded[i].branches))
         results = [None] * len(encoded)
         for start in range(0, len(order), self.decision_batch_size):
             indices = order[start:start+self.decision_batch_size]
-            batch = collate_serialized([encoded[i] for i in indices], pad)
-            length = batch["input_ids"].shape[1]
-            batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            output = self.core(batch, temperature=self.temperature)
+            items = [encoded[i] for i in indices]
+            if optimized:
+                output, costs, calls = score_bucketed(self.core, items, pad, self.temperature, self.branch_token_budget)
+            else:
+                batch = collate_serialized(items, pad)
+                length = batch["input_ids"].shape[1]
+                batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                output = self.core(batch, temperature=self.temperature)
+                costs = [len(item.branches)*length for item in items]
+                n = sum(len(item.branches) for item in items)
+                chunk = self.core.branch_microbatch_size or n
+                calls = (n+chunk-1)//chunk
+            self.execution_stats['encoded_branches'] += sum(len(item.branches) for item in items)
+            self.execution_stats['forward_padded_tokens'] += sum(costs)
+            self.execution_stats['backbone_calls'] += calls
             for row, index in enumerate(indices):
                 item = encoded[index]
                 results[index] = (output.log_probs[row, :len(item.option_ids)],
-                                  item.logical_token_count, len(item.branches)*length)
-        return results
+                                  item.logical_token_count, costs[row])
+        # Reused outputs retain the SAME differentiable graph, never detach or
+        # cache across optimizer steps. Charge executed tokens only on first use.
+        seen, expanded = set(), []
+        for index in mapping:
+            value, logical, executed = results[index]
+            expanded.append((value, logical, 0 if index in seen else executed))
+            seen.add(index)
+        return expanded
 
     def forward(self, state, view=View(), include_rel=True):
         return self.forward_batch([state], [view], include_rel=include_rel)[0]
 
-    def forward_batch(self, states, views=None, include_rel=True):
+    def forward_batch(self, states, views=None, include_rel=True, *, choice_needed=None, relevance_masks=None):
         """Multiple states share execution, never inputs, labels or normalization.
 
         Group task types separately to avoid padding short relevance inputs to
@@ -105,18 +149,27 @@ class SAJev(nn.Module):
         if not states:
             return []
         bodies = [requests(state, view, include_rel) for state, view in zip(states, views)]
+        if choice_needed is not None:
+            if len(choice_needed) != len(states): raise ValueError('choice mask length mismatch')
+            bodies = [(c if needed else None, s, r) for (c, s, r), needed in zip(bodies, choice_needed)]
+        if relevance_masks is None:
+            relevance_masks = [[True]*len(r) for _, _, r in bodies]
+        if len(relevance_masks) != len(states) or any(len(m) != len(r) for m, (_, _, r) in zip(relevance_masks, bodies)):
+            raise ValueError('relevance mask length mismatch')
         sufficient = self.decisions([suf for _, suf, _ in bodies])
         choices = iter(self.decisions([choice for choice, _, _ in bodies if choice is not None]))
-        relevance = iter(self.decisions([body for _, _, rel in bodies for body in rel]))
+        relevance = iter(self.decisions([body for (_, _, rel), mask in zip(bodies, relevance_masks)
+                                        for body, valid in zip(rel, mask) if valid]))
         predictions = []
-        for state, (choice, _, rel), (log_h, logical, executed) in zip(states, bodies, sufficient):
-            log_p = log_h.new_empty((0,))
+        for state, (choice, _, rel), (log_h, logical, executed), mask in zip(states, bodies, sufficient, relevance_masks):
+            # NaNs make accidental use of uncomputed predictions detectable.
+            log_p = log_h.new_full((len(state.candidates),), float('nan'))
             if choice is not None:
                 log_p, n, m = next(choices)
                 logical += n; executed += m
             log_rel = []
-            for _ in rel:
-                value, n, m = next(relevance)
+            for valid in mask:
+                value, n, m = next(relevance) if valid else (log_h.new_full((2,), float('nan')), 0, 0)
                 log_rel.append(value); logical += n; executed += m
             predictions.append(Prediction(tuple(e.id for e in state.candidates), log_p, log_h,
                                torch.stack(log_rel) if log_rel else log_h.new_empty((0, 2)), logical, executed))
@@ -125,7 +178,8 @@ class SAJev(nn.Module):
     @classmethod
     def from_pretrained(cls, artifact="shenjunhao/OpenJev-4B", *, revision=None, device="cuda",
                         branch_microbatch=1, trainable=True, lora_rank=16, lora_alpha=32,
-                        max_branch_length=None, max_decision_tokens=None, decision_batch_size=8):
+                        max_branch_length=None, max_decision_tokens=None, decision_batch_size=8,
+                        optimized_execution=False, branch_token_budget=0, checkpoint_mode='branch'):
         from openjev.artifacts import load_decision_artifact, sha256_file
         from .artifact_cache import prepare_openjev_artifact
         from .io import progress_phase
@@ -151,13 +205,18 @@ class SAJev(nn.Module):
             lora = dict(r=lora_rank, lora_alpha=lora_alpha, target_modules="all-linear", lora_dropout=0., bias="none")
             core.adapter.backbone = get_peft_model(core.adapter.backbone, LoraConfig(**lora))
             core.head.requires_grad_(True)
+            from .execution import configure_checkpointing
+            configure_checkpointing(core, checkpoint_mode)
         args = {k: v for k, v in config.serializer.items() if k != "version"}
         if max_branch_length is not None: args["max_branch_length"] = max_branch_length
         if max_decision_tokens is not None: args["max_decision_tokens"] = max_decision_tokens
         result = cls(core, tokenizer, DecisionSerializer(tokenizer, **args),
                      temperature=calibration["temperature"],
                      base_identity=sha256_file(Path(path) / "manifest.json"), lora_config=lora,
-                     decision_batch_size=decision_batch_size)
+                     decision_batch_size=decision_batch_size, optimized_execution=optimized_execution,
+                     branch_token_budget=branch_token_budget)
+        print(f'[OpenJev] optimized_execution={optimized_execution}; branch token budget={branch_token_budget}; '
+              f'checkpoint_mode={checkpoint_mode}', flush=True)
         if trainable:
             total = sum(p.numel() for p in result.parameters())
             updated = sum(p.numel() for p in result.parameters() if p.requires_grad)

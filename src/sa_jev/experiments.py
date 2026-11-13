@@ -106,7 +106,7 @@ def load_method(root, config, method, seed):
 
 
 def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resume=None, validation_limit=None,
-                  output_directory=None):
+                  output_directory=None, stress_check=False):
     from .public_indexes import require_public_question_protocol
     require_public_question_protocol(root, config)
     if variant not in {"stage1", "full", "dpo", "stability", "small_stage1", "small_k"} and not variant.startswith("stab_weight_"):
@@ -151,7 +151,10 @@ def train_variant(root, config, variant="stage1", seed=17, max_steps=None, resum
         model.load_trainable(latest(root, "small_stage1" if small else "stage1", seed))
         if cfg.dpo_weight:
             pairs = [PreferencePair.from_dict(x) for x in read_jsonl(data/f"preferences{suffix}.jsonl")]
-            reference = cache_reference(model, pairs, root/f"reference/seed_{seed}{suffix}.json")
+            reference = cache_reference(model, pairs, root/f"reference/seed_{seed}{suffix}.json", cfg.state_batch_size)
+    if stress_check:
+        from .performance import stress_probe
+        stress_probe(model, train, cfg, output, context_bank, pairs)
     from .io import progress_phase
     with progress_phase(f"[train] Stage {stage} run; progress below, output={output}", interval=120):
         history = fit(model, train, val, cfg, output, pairs=pairs, reference=reference, resume=resume,

@@ -524,9 +524,11 @@ MuSiQue 当前使用可回答部分。不可回答样本的标签仅对其规定
 - 三个主题相关、但不新增所需支持或改变有效条件的上下文扰动。
 - 一个真正新增已选支持证据的变化状态及重新计算的标签。
 
-当前提案优先从原始已标注干扰段中按词重合选取，加入 `context`，**只是草稿**。人工必须核查它确实没有引入可用支持、没有改变问题或条件，填写 `verified`、`reviewer`、`rationale`。原始干扰标签不是免人工核验的证明。
+当前提案优先从原始已标注干扰段中按词重合选取，加入 `context`，**只是草稿**。原始干扰标签不构成无关性的证明。05 现在提供独立测试包的 API 辅助审核：保持已准备好的 `MODE='full'`，先用 `REVIEW_LIMIT=3` 预检查，再改为 `None` 审核全部草稿。每包一次审核同时检查三种无关扰动及有效变化；结构检查排除标签错配、跨 split、重复上下文和复制未选候选正文等情况。API 审核使用问题、Gold 和具体状态，审核信息不会输入评测模型。
 
-审核后另存 `perturbations_reviewed.jsonl`，05 才会评价。`perturbations_draft.jsonl` 生成成功不表示已拥有一个核验完毕的鲁棒性 benchmark。
+审核按完整输入及审核配置缓存到 `data/perturbation_reviews/`；中断后重跑会复用缓存。预检查只生成 `perturbations_reviewed_preview.jsonl`，全部审核才生成 `perturbations_reviewed.jsonl`。不完整响应会停止，语义不合格包不会导出；无合格包则报错并保留 manifest 中的原因。不要通过改名或统一设置 `verified=True` 绕过审核。
+
+API 通过的条目明确标为 `review_type='llm'`、`reviewer='llm:<model>'`、`human_verified=False`；`verified` 在此仅表示该项通过记录的审核方式，不代表人工核验。配套 manifest 记录通过率、实际包数和独立问题数；`.human_spotcheck.json` 随机列出最多 10 个包供人工抽查，初始状态为待审核。论文必须如实报告机器审核及实际人工抽查情况，不宣称绝对语义保证。人工审核已有文件的工作流仍可直接使用 `robustness_experiment`；不要用机器审核入口覆盖没有对应生成记录的人工文件。
 
 三种无关扰动与干净状态保持相同候选集，可按 ID 对齐比较分布。有效变化会改变已选/剩余集合，评价新标签下的选择和充分性正确率，不要求与旧状态 JS 接近零。
 
