@@ -3,10 +3,25 @@ from __future__ import annotations
 
 from dataclasses import asdict, replace
 import torch
-from .schema import State, Labels, labels_for
+from .schema import State, Labels, labels_for, normalize
 from .io import digest, write_jsonl, write_json
 from pathlib import Path
 from .metrics import distribution_change, ndcg
+
+
+def context_proposals(q, state, limit=3):
+    """Original-question distractors outside unselected evidence; still need semantic review."""
+    candidates = [(e.id, normalize(e.text)) for e in state.candidates]
+    proposals, seen = [], set()
+    distractors = [e for e in q.evidence if e.id in q.known_negative_ids and not q.coverage.get(e.id)]
+    for e in sorted(distractors, key=lambda e: -len(set(e.text.lower().split()) & set(q.question.lower().split()))):
+        body = normalize(e.text)
+        context = normalize(e.title + "\n" + e.text)
+        if not body or context in seen or context == normalize(state.context): continue
+        if any(e.id == eid or (text and (text in context or body in text)) for eid, text in candidates): continue
+        proposals.append(e); seen.add(context)
+        if len(proposals) == limit: break
+    return proposals
 
 
 def review_packets(questions, states, output, limit=600):
@@ -17,11 +32,10 @@ def review_packets(questions, states, output, limit=600):
         q = lookup[state.question_id]
         if q.split != "heldout": raise ValueError("robustness packets must use reserved question families")
         y = labels_for(q, state)
-        if not y.gold_available: continue
+        if not y.gold_available or not y.suf_valid: continue
         # Draft related distractors; annotation must establish that they add no
         # support, alter no effective condition and preserve the intended labels.
-        distractors = [e for e in q.evidence if e.id in q.known_negative_ids]
-        proposals = sorted(distractors, key=lambda e: -len(set(e.text.lower().split()) & set(q.question.lower().split())))[:3]
+        proposals = context_proposals(q, state)
         if len(proposals) < 3: continue
         variants = [{"state": asdict(replace(state, context=e.title + "\n" + e.text)),
                      "source": e.source, "verified": False, "reviewer": "", "rationale": ""} for e in proposals]
@@ -30,6 +44,7 @@ def review_packets(questions, states, output, limit=600):
             for eid, gain in zip(y.candidate_ids, y.gains):
                 if gain > 0:
                     s = state.read(eid); new_y = labels_for(q, s)
+                    if not new_y.suf_valid: continue
                     changed = {"state": asdict(s), "labels": asdict(new_y), "verified": False,
                                "reviewer": "", "rationale": "", "change_type": "new_selected_evidence"}
                     break

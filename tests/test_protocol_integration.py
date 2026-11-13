@@ -48,7 +48,7 @@ def test_light_rag_cache_query_once_and_traceability(tmp_path):
 
 def test_review_required_and_effective_labels(tmp_path):
     q=replace(fixture_questions()[0],split="heldout")
-    state=State(q.id,q.group_id,q.question,Pool(q.id,q.evidence,"fixture"),budget=3)
+    state=State(q.id,q.group_id,q.question,Pool(q.id,q.evidence[:2],"fixture"),budget=3)
     packets=review_packets([q],[state],tmp_path/"draft.jsonl")
     with pytest.raises(ValueError): validate_packet(packets[0],[q.group_id])
     for row in [*packets[0]["perturbations"],packets[0]["effective"]]:

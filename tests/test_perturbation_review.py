@@ -5,7 +5,8 @@ import pytest
 
 from sa_jev.io import read_json, read_jsonl, write_jsonl
 from sa_jev.perturbation_review import (CHECKS, EFFECTIVE_CHECKS, approved, complete,
-                                       prepare_perturbation_reviews)
+                                       prepare_perturbation_reviews, screen_perturbation_drafts,
+                                       structural_check)
 from sa_jev.robustness import review_packets, validate_packet
 from sa_jev.schema import Evidence, Question, Pool, State
 from sa_jev.prompts import requests
@@ -135,3 +136,44 @@ def test_string_booleans_uncertain_and_missing_items_cannot_approve():
     review = FakeReviewer()({})
     review["verdict"]["perturbations"].pop()
     assert not complete(review)
+
+
+def test_repair_legacy_candidate_overlap_preserves_states_and_labels(prepared):
+    root, cfg, q, s, _ = prepared
+    extra = Evidence.make("Extra", "Additional independent distractor paragraph.", "source/extra")
+    q = replace(q, evidence=q.evidence + (extra,), known_negative_ids=q.known_negative_ids + (extra.id,))
+    s = replace(s, pool=replace(s.pool, candidates=s.pool.candidates + (q.evidence[2],)))
+    packets = review_packets([q], [s], root / "data/perturbations_draft.jsonl")
+    assert len(packets) == 1  # New generator chooses three non-candidate originals.
+    structural_check(packets[0], q)
+    # Recreate the old generator's faulty proposal.
+    packets[0]["perturbations"][0]["state"] = asdict(replace(s, context=q.evidence[2].title + "\n" + q.evidence[2].text))
+    write_jsonl(root / "data/questions.jsonl", [q])
+    write_jsonl(root / "data/perturbations_draft.jsonl", packets)
+    original = (root / "data/perturbations_draft.jsonl").read_bytes()
+    summary = screen_perturbation_drafts(root)
+    assert summary["repaired_packets"] == 1 and summary["eligible_packets"] == 1
+    fixed = list(read_jsonl(summary["output"]))[0]
+    for key in ("clean", "clean_labels", "effective", "packet_id"):
+        from sa_jev.io import canonical
+        assert canonical(fixed[key]) == canonical(packets[0][key])
+    structural_check(fixed, q)
+    assert (root / "data/perturbations_draft.jsonl").read_bytes() == original
+    report = prepare_perturbation_reviews(root, cfg, limit=1, draft_path=summary["output"], reviewer=FakeReviewer())
+    assert report["accepted_packets"] == 1
+
+
+def test_screening_does_not_weaken_labels_or_fill_missing_sources(prepared):
+    root, cfg, q, s, packets = prepared
+    for view in packets[0]["perturbations"]:
+        view["state"]["context"] = q.evidence[0].title + "\n" + q.evidence[0].text
+    # Only two distractors remain outside the candidate pool.
+    q = replace(q, known_negative_ids=q.known_negative_ids[:2])
+    packets = packets[:1]
+    write_jsonl(root / "data/questions.jsonl", [q])
+    write_jsonl(root / "data/perturbations_draft.jsonl", packets)
+    with pytest.raises(ValueError, match="No structurally eligible"):
+        screen_perturbation_drafts(root)
+    manifest = read_json(root / "data/perturbations_screened_draft.manifest.json")
+    assert manifest["excluded_packets"] == 1
+    assert "fewer than three" in manifest["decisions"][0]["reason"]

@@ -1,11 +1,12 @@
 """05 notebook cells, shared with the notebook generator."""
 TITLE = '# 独立干扰与有效变化\n先对 heldout 草稿做可缓存的机器审核，再评测；人工抽查另行记录。禁止用于训练或调参。'
 ROBUSTNESS = [
-    ('md', '先审核已有 heldout 扰动草稿，再评测。审核通过表示机器审核，不代表人工核验或绝对语义保证。默认只预检查 3 个包；确认 API 返回正常后设置 REVIEW_LIMIT=None。预检查不写正式测试文件，不运行模型评测。'),
+    ('md', '先对全部旧草稿做结构筛查：重合的上下文替换为同题中不与未选候选重合的其他原文段落；无足够来源的包记录排除原因。原草稿、候选池和任务标签保持不变。随后 API 审核；通过表示机器审核，不代表人工核验或绝对语义保证。默认预检查前 3 个结构合格包，确认 API 返回正常后设置 REVIEW_LIMIT=None。预检查不写正式测试文件，不运行模型评测。'),
     ('code', '''from pathlib import Path
 import importlib
-from sa_jev import context_views, perturbation_review
+from sa_jev import context_views, robustness, perturbation_review
 importlib.reload(context_views)
+importlib.reload(robustness)
 importlib.reload(perturbation_review)
 
 # 保持 MODE='full' 使用已经准备好的数据；不要为了少量检查切换 ROOT。
@@ -15,10 +16,12 @@ data_dir = ROOT / 'data'
 draft_path = data_dir / 'perturbations_draft.jsonl'
 if not draft_path.exists():
     cli('review-packets')
-print('草稿:', draft_path)
-print('审核范围:', '全部草稿' if REVIEW_LIMIT is None else f'前 {REVIEW_LIMIT} 个包（预检查）')'''),
+screening_summary = perturbation_review.screen_perturbation_drafts(ROOT)  # 结构检查，不调用 API。
+screened_draft_path = Path(screening_summary['output'])
+print('结构合格草稿:', screened_draft_path)
+print('API 审核范围:', '全部结构合格草稿' if REVIEW_LIMIT is None else f'前 {REVIEW_LIMIT} 个结构合格包（预检查）')'''),
     ('code', '''review_summary = perturbation_review.prepare_perturbation_reviews(
-    ROOT, config, limit=REVIEW_LIMIT)
+    ROOT, config, limit=REVIEW_LIMIT, draft_path=screened_draft_path)
 print({k: v for k, v in review_summary.items() if k != 'decisions'})'''),
     ('md', '审核中断后重跑审核格，会复用逐包缓存。API 输出不完整时停止并保留原始响应；不伪造审核通过。全部审核后，data/perturbations_reviewed.jsonl 保存合格包，配套 manifest 记录实际数量、通过率和拒绝原因；perturbation_reviews/ 保存原文、Gold 和 API 审核记录（仅审核使用，不输入评测模型）。perturbations_reviewed.human_spotcheck.json 是待填写的人工抽查清单，不代表人工审核已完成。论文需报告机器审核及真实人工抽查结果；若发现错误，应修正或移除对应包并更新评测集记录，不能用于选择模型或调参。'),
     ('code', '''from sa_jev.experiments import robustness_experiment

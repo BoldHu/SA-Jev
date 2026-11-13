@@ -2,14 +2,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 import random
 import time
 
 from .context_views import ContextReviewer, CHECKS
 from .io import digest, read_json, read_jsonl, write_json, write_jsonl
-from .robustness import validate_packet
+from .robustness import validate_packet, context_proposals
 from .schema import Question, State, Labels, labels_for, normalize
 
 PROTOCOL = "heldout_perturbation_review_v1"
@@ -97,7 +97,66 @@ def structural_check(packet, q):
     if len(set(contexts)) != 3: raise ValueError("duplicate perturbation contexts")
 
 
-def prepare_perturbation_reviews(root, config, *, limit=3, reviewer=None):
+def screen_perturbation_drafts(root):
+    """Repair legacy context overlap without changing states, pools or labels; no API calls.
+
+    Preserve original drafts. Only replace contexts for the specific candidate-copy
+    failure, using other original-question distractors. Other structural failures
+    and states lacking three safe sources are excluded with explicit reasons.
+    """
+    data = Path(root) / "data"
+    source = data / "perturbations_draft.jsonl"
+    packets = list(read_jsonl(source))
+    lookup = {q.id: q for q in (Question.from_dict(x) for x in read_jsonl(data / "questions.jsonl"))}
+    rows, decisions = [], []
+    repaired = 0
+    for packet in packets:
+        q = lookup[packet["clean"]["question_id"]]
+        row = deepcopy(packet)
+        reason = None
+        try:
+            structural_check(row, q)
+        except ValueError as exc:
+            reason = str(exc)
+        if reason == "context copies unselected candidate text into sufficiency input":
+            clean = State.from_dict(row["clean"])
+            proposals = context_proposals(q, clean)
+            if len(proposals) < 3:
+                reason = "fewer than three original-question distractors outside unselected candidates"
+            else:
+                row["perturbations"] = [
+                    {"state": asdict(replace(clean, context=e.title + "\n" + e.text)),
+                     "source": e.source, "verified": False, "reviewer": "", "rationale": ""}
+                    for e in proposals]
+                try:
+                    structural_check(row, q)
+                except ValueError as exc:
+                    reason = str(exc)
+                else:
+                    reason = None
+                    repaired += 1
+        decisions.append({"packet_id": packet["packet_id"], "eligible": reason is None,
+                          "contexts_replaced": row["perturbations"] != packet["perturbations"], "reason": reason})
+        if reason is None: rows.append(row)
+    output = data / "perturbations_screened_draft.jsonl"
+    summary = {"source": str(source), "source_hash": digest(packets), "output": str(output),
+               "input_packets": len(packets), "eligible_packets": len(rows), "repaired_packets": repaired,
+               "excluded_packets": len(packets)-len(rows),
+               "eligible_questions": len({p["clean"]["question_id"] for p in rows}),
+               "verified_packets": 0, "status": "structurally_screened_only",
+               "decisions": decisions}
+    write_jsonl(output, rows)
+    write_json(output.with_suffix(".manifest.json"), summary)
+    from collections import Counter
+    reasons = Counter(d["reason"] for d in decisions if d["reason"])
+    print(f"[perturbation screening] input={len(packets)} eligible={len(rows)} repaired={repaired} "
+          f"excluded={len(packets)-len(rows)}; API=0; original drafts preserved", flush=True)
+    for reason, count in reasons.items(): print(f"  {count}: {reason}", flush=True)
+    if not rows: raise ValueError(f"No structurally eligible packets. Inspect {output.with_suffix('.manifest.json')}; more source paragraphs are needed.")
+    return summary
+
+
+def prepare_perturbation_reviews(root, config, *, limit=3, reviewer=None, draft_path=None):
     """limit=N writes a preview only; limit=None publishes the complete screened set.
 
     Per-packet caches bind the full packet, original question/gold, and reviewer.
@@ -106,7 +165,7 @@ def prepare_perturbation_reviews(root, config, *, limit=3, reviewer=None):
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("limit must be a positive integer or None")
     data = Path(root) / "data"
-    draft = data / "perturbations_draft.jsonl"
+    draft = Path(draft_path) if draft_path is not None else data / "perturbations_draft.jsonl"
     if not draft.exists(): raise FileNotFoundError(f"Missing {draft}; run cli('review-packets') first")
     packets = list(read_jsonl(draft))
     if not packets: raise ValueError("perturbation draft is empty; inspect its manifest")
@@ -145,6 +204,7 @@ def prepare_perturbation_reviews(root, config, *, limit=3, reviewer=None):
             structural_check(packet, q)
         except ValueError as exc:
             structural_rejected += 1
+            print(f"[perturbation review] structural rejection: {exc}", flush=True)
             decisions.append({"packet_id": packet["packet_id"], "accepted": False,
                               "kind": "structural", "reason": str(exc)})
         else:
