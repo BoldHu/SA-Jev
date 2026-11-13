@@ -122,11 +122,12 @@ def safe_source(q, examples, evidence, forbidden_texts, min_words, max_words):
     return bool(terms(q.question) & terms(text))
 
 
-def prepare_context_views(root, config, *, small_k=False, limit=None, reviewer=None):
+def prepare_context_views(root, config, *, small_k=False, limit=None, reviewer=None,
+                          question_ids=None, output_path=None):
     """Resumable review preparation; does not rebuild task states, pools or DPO pairs."""
     data = Path(root) / "data"
     suffix = "_small_k" if small_k else ""
-    output = data / f"training_contexts{suffix}.json"
+    output = Path(output_path) if output_path is not None else data / f"training_contexts{suffix}.json"
     options = {"min_words": 24, "max_words": 384, "max_candidates": 2,
                **config.get("context_views", {})}
     if not 1 <= options["min_words"] <= options["max_words"] or options["max_candidates"] < 1:
@@ -169,6 +170,11 @@ def prepare_context_views(root, config, *, small_k=False, limit=None, reviewer=N
             print("[context] Reusing complete reviewed training bank:", old["summary"], flush=True)
             return {**old["summary"], "new_api_calls": 0, "reused_complete_bank": True}
     ids = sorted(grouped)
+    if question_ids is not None:
+        requested = set(question_ids)
+        if requested - set(grouped):
+            raise ValueError("context probe question IDs must belong to training tasks")
+        ids = [qid for qid in ids if qid in requested]
     if limit is not None: ids = ids[:limit]
     cache = data / "context_reviews"; cache.mkdir(exist_ok=True)
     accepted, audited = [], []

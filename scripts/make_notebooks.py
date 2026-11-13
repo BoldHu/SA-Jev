@@ -112,7 +112,7 @@ def create(name, title, content):
                          "language_info":{"name":"python"}, "colab":{"name":name}, "accelerator":"GPU"}
     if name == '00_environment_data.ipynb':
         notebook.metadata.pop('accelerator', None)  # CPU is sufficient for data preparation.
-    if name == '02_stage1.ipynb':
+    if name in {'02_stage1.ipynb', '03_stage2.ipynb'}:
         notebook.cells[1].source = notebook.cells[1].source.replace("MODE = 'pilot'", "MODE = 'full'")
     target=ROOT/'notebooks'/name; target.parent.mkdir(exist_ok=True)
     nbf.write(notebook,target)
@@ -175,9 +175,58 @@ if returncode:
 ('md', '检查 training.csv/PNG/PDF、验证 loss、实际显存和 ETA。4GB 本地 tiny 测试不能代替 4B A100 测试；OOM 时降低 branch_microbatch，不切分 softmax，不截断证据，不改变标签。恢复训练使用 train_variant(..., resume=checkpoint_path)。')])
 
 create('03_stage2.ipynb', '# Stage 2 · 整轨迹 DPO + 核验上下文双视图\n干净状态 vs 追加主题相关但不提供支持的 context。L_task(two views) + 0.2 DPO + 0.1 stability；β=0.1，容忍区间 0.05。预算耗尽不算自主 STOP。', [
-('md', '先执行下面的上下文准备格：读取 00 已保存的任务状态，从训练语料选段落并用 .env 中的 API 审核，结果逐条缓存到 Drive；不重做检索、候选挖掘或 DPO 轨迹。默认每题最多审核 2 段，接受 1 段，长度 24–384 词；12,000 题首次最多 24,000 次审核请求，实际数量取决于过滤与提前接受。复跑复用缓存。可以先在 CPU 运行此格；训练格才需要 A100。API 审核不等于人工核验或语义保证，论文必须报告审核方式、通过率和人工抽查；独立测试包不得用于这里。'),
-('code', "from sa_jev.context_views import prepare_context_views\ncontext_summary = prepare_context_views(ROOT, config)\ncontext_summary"),
-('code', "from sa_jev.experiments import train_variant\nfor seed in ([17] if MODE=='pilot' else config['seeds']):\n    train_variant(ROOT, config, 'full', seed, max_steps=2 if MODE=='pilot' else None, validation_limit=6 if MODE=='pilot' else None)"),
+('md', '默认仅联调：MODE=full 读取已准备数据，RUN_FULL_STAGE2=False 控制小规模运行。自动寻找 02 最近成功的 Stage 1 试跑检查点；最多审核 4 道有真实偏好轨迹的训练题，每题最多 2 段（最多 8 次段落审核，底层网络重试另计），最多 2 对完整轨迹和 2 步训练。原始审核缓存可复用，部分上下文包与参考概率写到独立 stage2_probe 目录，不覆盖正式上下文包、参考或模型。审核可用 CPU；训练使用 A100。无合格段落时停止并检查原因，不强行构造稳定性对。设 RUN_FULL_STAGE2=True 会执行全量审核和正式训练，且要求正式 Stage 1 检查点；目前请保持 False。'),
+('code', '''import copy, importlib, torch
+from datetime import datetime, timezone
+from uuid import uuid4
+from sa_jev import model, training, experiments, context_views, probes
+for module in (model, training, experiments, context_views, probes):
+    importlib.reload(module)
+RUN_FULL_STAGE2 = False
+PROBE_STEPS = 2
+PROBE_QUESTIONS = 4
+PROBE_PAIRS = 2
+STAGE1_CHECKPOINT = None  # None selects the most recent completed 02 probe.
+probe_config = copy.deepcopy(config)
+probe_config['model'].update(branch_microbatch=1, decision_batch_size=8)
+probe_config['training'].update(accumulation=2, state_batch_size=1,
+                                validate_every=1, save_every=1)
+gpu_gib = torch.cuda.get_device_properties(0).total_memory/1024**3 if torch.cuda.is_available() else None
+probe_config['training']['memory_limit_gib'] = min(38.0, gpu_gib-2.0) if gpu_gib else 38.0
+probe_config.setdefault('context_views', {})['max_candidates'] = 2
+if not RUN_FULL_STAGE2:
+    STAGE1_CHECKPOINT = Path(STAGE1_CHECKPOINT) if STAGE1_CHECKPOINT else probes.latest_stage1_probe(ROOT)
+    probe_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '_' + uuid4().hex[:6]
+    PROBE_OUTPUT = ROOT/'runs/stage2_probe'/probe_id/'seed_17'
+    print('Source data:', ROOT, flush=True)
+    print('Stage 1 probe checkpoint:', STAGE1_CHECKPOINT, flush=True)
+    print('Stage 2 probe output:', PROBE_OUTPUT, flush=True)
+    print('Limits: questions=', PROBE_QUESTIONS, 'pairs=', PROBE_PAIRS, 'updates=', PROBE_STEPS, flush=True)
+else:
+    print('FORMAL STAGE 2: full context review, full references, and formal Stage-1 checkpoints required.', flush=True)
+'''),
+('code', '''if RUN_FULL_STAGE2:
+    from sa_jev.context_views import prepare_context_views
+    context_summary = prepare_context_views(ROOT, config)
+else:
+    context_summary = probes.prepare_stage2_probe(
+        ROOT, probe_config, PROBE_OUTPUT, STAGE1_CHECKPOINT,
+        question_limit=PROBE_QUESTIONS,
+    )
+context_summary
+'''),
+('code', '''assert torch.cuda.is_available(), 'Stage-2 model training requires a GPU runtime; review preparation can run on CPU.'
+if RUN_FULL_STAGE2:
+    from sa_jev.experiments import train_variant
+    for seed in config['seeds']:
+        train_variant(ROOT, config, 'full', seed)
+else:
+    history = probes.run_stage2_probe(
+        ROOT, probe_config, PROBE_OUTPUT, STAGE1_CHECKPOINT,
+        max_steps=PROBE_STEPS, pair_limit=PROBE_PAIRS, validation_limit=2,
+    )
+    print('Stage-2 probe completed; inspect probe_checks.json. These weights are for pipeline checks only.', flush=True)
+'''),
 ('md', '冻结参考和 DPO 均保留干净轨迹，旧 preferences.jsonl 可复用。两视图使用相同标签，只有普通 context 字段追加已审核文本，不显示“无关”标记或审核信息。无合格段落、未知标签或追加后超出 token 上限的状态只做干净任务训练；不截断证据，不把真实状态变化当作不变对。training.jsonl 记录 context_pairs、unpaired_states、context_over_budget 和各稳定性有效数。旧序列化控制可设 config[\'training\'][\'context_view_mode\']=\'serialization\'，须使用独立实验目录，不能混合续训。')])
 
 create('04_main_comparison.ipynb', '# 主性能 · 共享召回池与回答模型\nHotpotQA / MuSiQue / 2Wiki 跨数据集；保存逐题原始轨迹和配对统计。', [

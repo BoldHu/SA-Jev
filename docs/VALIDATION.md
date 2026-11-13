@@ -76,6 +76,10 @@
 
 ## 仍需在 Colab/真实服务运行
 
+2026-11-12 Stage 2 有界联调入口：03 默认读取 full 数据，但 `RUN_FULL_STAGE2=False`；自动定位最近成功的 Stage 1 probe。新增 `probes.py` 限定独立输出目录、验证现有问题协议与重叠审计、从真实偏好对选最多 4 个训练问题进行段落审核；部分上下文包写入 probe 目录，原始审核缓存按状态绑定复用。训练只用该包对应状态、最多 2 对完整偏好、2 条验证状态和 2 步，不重建轨迹、不计算全量冻结参考、不覆盖正式模型。新增检查覆盖限量、完整轨迹指纹、审核缓存复用、正式产物保护、无合格审核拒绝执行及输出路径/审计前置验证；结合原上下文与 notebook 校验共 11 项通过。测试使用明确标为 TEST_ONLY 的小模型和模拟审核器，未调用真实 API，未运行真实 4B Stage 2。默认 branch/state microbatch 均为 1，A100 40GB 上的完整轨迹反向峰值仍须由用户短试跑验证。
+
+2026-11-12 用户 A100-SXM4-40GB 实测更新：真实 4B 的 `state_batch_size=2 / branch_microbatch=2 / decision_batch_size=8` 已完成 6 步（48 个状态），第 2–5 步中位数 95.77 秒，峰值 allocated=28.23 GiB、reserved=32.76 GiB；6 条验证状态完成且 step_000006 保存成功。验证 rank-valid=0，不能作为排序效果验证。随后 `state_batch_size=1 / branch_microbatch=4` 在第 1 步第 1 条状态（剩余 K=13）的梯度检查点反向重计算、MLP/LoRA 运算中 OOM：设备 39.49 GiB，进程占用 39.41 GiB，PyTorch allocated=35.94 GiB，reserved-but-unallocated=1.88 GiB，申请 78 MiB 时仅余 75.44 MiB。该配置未完成第一次参数更新；先前成功试跑位于另一个目录，不受影响。02 已恢复 2/2。此 40GB 环境不再推荐分支 microbatch=4；OOM 后重启会话再加载模型，不能通过提高事后 memory_limit 绕过物理容量。完整长输入与正式训练仍未验证。
+
 2026-11-12 后续跨状态合批：新增 `SAJev.forward_batch`，充分性、Choice、相关性分别合批，按状态返回候选 ID 对齐的预测。训练/验证接入 `state_batch_size`，02/public 配置为 2；旧 `accumulation=8` 仍表示每次更新的有效状态数。两个状态及其合格视图组成一次计算图后共同反向，四个二状态 microbatch 后更新；DPO 仍按原轨迹与每 step 一对偏好执行。单状态/多状态的输出、全部梯度及有效标签加权后的优化器更新通过对比，涵盖不同 K、空候选、部分有效标签、末尾不足一批和跨状态输入隔离；Stage 2 混合双视图、DPO 与精确断点恢复也通过。此前记录的“多状态仍串行”仅适用于上一个版本。
 
 真实小型 Qwen3.5 + LoRA 在本地 CUDA 上复测两个不同状态，串行与跨状态合批的概率、损失、全部梯度在容差内一致（最大梯度绝对差约 `1.8e-8`），优化器更新通过；记录 `outputs/state_batching_check/cuda.json`。仍只验证了本地 Torch Delta 路径，不能代替真实 OpenJev-4B + FLA + A100 的吞吐和长输入显存试验。没有重建数据或运行正式训练。
